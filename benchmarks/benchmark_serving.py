@@ -30,7 +30,7 @@ import random
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
@@ -103,6 +103,16 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
+    # Decode iteration time: total time per decode step (including overhead)
+    mean_decode_iteration_time_ms: float = 0.0
+    median_decode_iteration_time_ms: float = 0.0
+    std_decode_iteration_time_ms: float = 0.0
+    percentiles_decode_iteration_time_ms: list[tuple[float, float]] = field(default_factory=list)
+    # Pure computation time: model forward pass time per decode step
+    mean_pure_computation_time_ms: float = 0.0
+    median_pure_computation_time_ms: float = 0.0
+    std_pure_computation_time_ms: float = 0.0
+    percentiles_pure_computation_time_ms: list[tuple[float, float]] = field(default_factory=list)
 
 
 async def get_request(
@@ -168,6 +178,9 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
+    # Collect decode timing data
+    decode_iteration_times: list[float] = []
+    pure_computation_times: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -195,6 +208,11 @@ def calculate_metrics(
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
+            # Collect decode timing data if available
+            if outputs[i].decode_step_times:
+                decode_iteration_times.extend(outputs[i].decode_step_times)
+            if outputs[i].decode_compute_times:
+                pure_computation_times.extend(outputs[i].decode_compute_times)
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -263,6 +281,19 @@ def calculate_metrics(
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
+        # Decode timing statistics  
+        mean_decode_iteration_time_ms=np.mean(decode_iteration_times) if decode_iteration_times else 0.0,
+        median_decode_iteration_time_ms=np.median(decode_iteration_times) if decode_iteration_times else 0.0,
+        std_decode_iteration_time_ms=np.std(decode_iteration_times) if decode_iteration_times else 0.0,
+        percentiles_decode_iteration_time_ms=[
+            (p, np.percentile(decode_iteration_times, p)) for p in selected_percentiles
+        ] if decode_iteration_times else [],
+        mean_pure_computation_time_ms=np.mean(pure_computation_times) if pure_computation_times else 0.0,
+        median_pure_computation_time_ms=np.median(pure_computation_times) if pure_computation_times else 0.0,
+        std_pure_computation_time_ms=np.std(pure_computation_times) if pure_computation_times else 0.0,
+        percentiles_pure_computation_time_ms=[
+            (p, np.percentile(pure_computation_times, p)) for p in selected_percentiles
+        ] if pure_computation_times else [],
     )
 
     return metrics, actual_output_lens
@@ -518,6 +549,8 @@ async def benchmark(
     process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+    process_one_metric("decode_iteration_time", "Decode Iteration Time", "Decode Iteration Time")
+    process_one_metric("pure_computation_time", "Pure Computation Time", "Pure Computation Time")
 
     print("=" * 50)
 

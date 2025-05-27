@@ -110,6 +110,15 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
     prompt_tokens_details: Optional[PromptTokenUsageInfo] = None
+    # Decode timing information
+    decode_step_times: Optional[list[float]] = Field(
+        default=None,
+        description="List of total time for each decode step (in milliseconds)"
+    )
+    decode_compute_times: Optional[list[float]] = Field(
+        default=None, 
+        description="List of pure computation time for each decode step (in milliseconds)"
+    )
 
 
 class RequestResponseMetadata(BaseModel):

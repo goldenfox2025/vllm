@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from collections.abc import Sequence as GenericSequence
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, List
 
 import msgspec
 import torch
@@ -109,8 +109,10 @@ class RequestMetrics:
         model_forward_time: The time spent in the model forward pass when this
                             request was in the batch.
         model_execute_time: The time spent in the model execute function. This
-                            will include model forward, block/sync across
-                            workers, cpu-gpu sync time and sampling time.
+                            includes the time spent in the model forward pass
+                            and the time spent in the sampler.
+        decode_step_times: List of total time for each decode step (ms).
+        decode_compute_times: List of pure computation time for each decode step (ms).
         spec_token_acceptance_counts: number of accepted speculative tokens at
                                       each position; the first token is from
                                       the target model and is always accepted;
@@ -128,6 +130,8 @@ class RequestMetrics:
     scheduler_time: Optional[float] = None
     model_forward_time: Optional[float] = None
     model_execute_time: Optional[float] = None
+    decode_step_times: List[float] = field(default_factory=list)
+    decode_compute_times: List[float] = field(default_factory=list)
     spec_token_acceptance_counts: Optional[list[int]] = None
 
 

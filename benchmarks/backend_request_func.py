@@ -46,6 +46,9 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
+    # Decode timing information from API response
+    decode_step_times: list[float] = field(default_factory=list)  # Total time for each decode step (ms)
+    decode_compute_times: list[float] = field(default_factory=list)  # Pure computation time for each decode step (ms)
 
 
 async def async_request_tgi(
@@ -319,6 +322,11 @@ async def async_request_openai_completions(
                                 generated_text += text or ""
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                # Extract decode timing information if available
+                                if "decode_step_times" in usage:
+                                    output.decode_step_times = usage["decode_step_times"]
+                                if "decode_compute_times" in usage:
+                                    output.decode_compute_times = usage["decode_compute_times"]
                     if first_chunk_received:
                         output.success = True
                     else:
@@ -416,6 +424,11 @@ async def async_request_openai_chat_completions(
                                 generated_text += content or ""
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                # Extract decode timing information if available
+                                if "decode_step_times" in usage:
+                                    output.decode_step_times = usage["decode_step_times"]
+                                if "decode_compute_times" in usage:
+                                    output.decode_compute_times = usage["decode_compute_times"]
 
                             most_recent_timestamp = timestamp
 
@@ -523,6 +536,11 @@ async def async_request_openai_audio(
                                     output.output_tokens = usage.get(
                                         "completion_tokens"
                                     )
+                                    # Extract decode timing information if available
+                                    if "decode_step_times" in usage:
+                                        output.decode_step_times = usage["decode_step_times"]
+                                    if "decode_compute_times" in usage:
+                                        output.decode_compute_times = usage["decode_compute_times"]
 
                                 most_recent_timestamp = timestamp
 

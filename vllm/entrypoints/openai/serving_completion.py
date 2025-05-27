@@ -303,7 +303,9 @@ class OpenAIServingCompletion(OpenAIServing):
             include_usage, include_continuous_usage = False, False
 
         try:
+            last_res = None
             async for prompt_idx, res in result_generator:
+                last_res = res
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
                 prompt_text = res.prompt
@@ -402,6 +404,13 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens)
+
+            # Add decode timing information if available
+            if last_res and last_res.metrics:
+                if last_res.metrics.decode_step_times:
+                    final_usage_info.decode_step_times = last_res.metrics.decode_step_times
+                if last_res.metrics.decode_compute_times:
+                    final_usage_info.decode_compute_times = last_res.metrics.decode_compute_times
 
             if include_usage:
                 final_usage_chunk = CompletionStreamResponse(
@@ -506,6 +515,14 @@ class OpenAIServingCompletion(OpenAIServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
+        
+        # Add decode timing information if available
+        if final_res_batch and final_res_batch[0].metrics:
+            metrics = final_res_batch[0].metrics
+            if metrics.decode_step_times:
+                usage.decode_step_times = metrics.decode_step_times
+            if metrics.decode_compute_times:
+                usage.decode_compute_times = metrics.decode_compute_times
 
         request_metadata.final_usage_info = usage
 

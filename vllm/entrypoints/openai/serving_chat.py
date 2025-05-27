@@ -852,32 +852,32 @@ class OpenAIServingChat(OpenAIServing):
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
             if include_usage:
-                completion_tokens = sum(previous_num_tokens)
-                final_usage = UsageInfo(prompt_tokens=num_prompt_tokens,
-                                        completion_tokens=completion_tokens,
-                                        total_tokens=num_prompt_tokens +
-                                        completion_tokens)
-                if self.enable_prompt_tokens_details and num_cached_tokens:
-                    final_usage.prompt_tokens_details = PromptTokenUsageInfo(
-                        cached_tokens=num_cached_tokens)
-
+                # report to FastAPI middleware aggregate usage across all choices
+                num_completion_tokens = sum(previous_num_tokens)
+                final_usage_info = UsageInfo(
+                    prompt_tokens=num_prompt_tokens,
+                    completion_tokens=num_completion_tokens,
+                    total_tokens=num_prompt_tokens + num_completion_tokens)
+                
+                # Add decode timing information if available from the last result
+                if res and res.metrics:
+                    if res.metrics.decode_step_times:
+                        final_usage_info.decode_step_times = res.metrics.decode_step_times
+                    if res.metrics.decode_compute_times:
+                        final_usage_info.decode_compute_times = res.metrics.decode_compute_times
+                
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
                     created=created_time,
                     choices=[],
                     model=model_name,
-                    usage=final_usage)
+                    usage=final_usage_info)
                 final_usage_data = (final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True))
                 yield f"data: {final_usage_data}\n\n"
-
-            # report to FastAPI middleware aggregate usage across all choices
-            num_completion_tokens = sum(previous_num_tokens)
-            request_metadata.final_usage_info = UsageInfo(
-                prompt_tokens=num_prompt_tokens,
-                completion_tokens=num_completion_tokens,
-                total_tokens=num_prompt_tokens + num_completion_tokens)
+                
+                request_metadata.final_usage_info = final_usage_info
 
         except Exception as e:
             # TODO: Use a vllm-specific Validation Error
@@ -1076,6 +1076,13 @@ class OpenAIServingChat(OpenAIServing):
         if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens)
+        
+        # Add decode timing information if available
+        if final_res.metrics:
+            if final_res.metrics.decode_step_times:
+                usage.decode_step_times = final_res.metrics.decode_step_times
+            if final_res.metrics.decode_compute_times:
+                usage.decode_compute_times = final_res.metrics.decode_compute_times
 
         request_metadata.final_usage_info = usage
 

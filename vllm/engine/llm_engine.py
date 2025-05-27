@@ -1314,6 +1314,8 @@ class LLMEngine:
                 break
         ```
         """
+        step_start_time = time.perf_counter()  # 记录step开始时间
+        
         if self.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallelism is only supported through AsyncLLMEngine "
@@ -1376,7 +1378,10 @@ class LLMEngine:
         assert seq_group_metadata_list is not None
         assert scheduler_outputs is not None
 
+        compute_time = 0.0  # 初始化计算时间
+        
         if not scheduler_outputs.is_empty():
+            compute_start_time = time.perf_counter()  # 记录计算开始时间
 
             # Check if we have a cached last_output from the previous iteration.
             # For supporting PP this is probably the best way to pass the
@@ -1418,6 +1423,8 @@ class LLMEngine:
                     allow_async_output_proc=allow_async_output_proc)
                 # Raise so the caller is notified that this request failed
                 raise
+
+            compute_time = time.perf_counter() - compute_start_time  # 计算时间
 
             # We need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.
@@ -1489,6 +1496,43 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
+
+        # 记录并输出时间统计（针对LoRA性能分析：测量完整iteration）
+        step_total_time = time.perf_counter() - step_start_time
+        if scheduler_outputs and scheduler_outputs.scheduled_seq_groups:
+            overhead_time = step_total_time - compute_time
+            
+            # 统计当前批次的LoRA使用情况
+            lora_requests_in_batch = []
+            total_sequences = 0
+            for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+                seq_group = scheduled_seq_group.seq_group
+                total_sequences += len(seq_group.seqs)
+                if seq_group.lora_request:
+                    lora_requests_in_batch.append(seq_group.lora_request.lora_name)
+            
+            unique_loras = len(set(lora_requests_in_batch))
+            lora_coverage = len(lora_requests_in_batch) / total_sequences if total_sequences > 0 else 0
+            
+            # 将时间数据存储到每个seq_group的metrics中（不区分prefill/decode）
+            for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+                seq_group = scheduled_seq_group.seq_group
+                if seq_group.metrics:
+                    # 转换为毫秒并添加到时间列表中
+                    seq_group.metrics.decode_step_times.append(step_total_time * 1000)
+                    seq_group.metrics.decode_compute_times.append(compute_time * 1000)
+            
+            # 详细的LoRA性能日志
+            logger.debug(f"[LORA_TIMING] Total: {step_total_time*1000:.2f}ms, "
+                        f"Compute: {compute_time*1000:.2f}ms, "
+                        f"Overhead: {overhead_time*1000:.2f}ms, "
+                        f"UniqueLoRAs: {unique_loras}, "
+                        f"LoRACoverage: {lora_coverage:.2f}, "
+                        f"BatchSize: {total_sequences}, "
+                        f"PrefillGroups: {scheduler_outputs.num_prefill_groups}")
+            
+            # 简化的连续时间记录 - 直接写入文件
+            self._simple_record_continuous_timing(step_total_time, compute_time, scheduler_outputs)
 
         return ctx.request_outputs
 
@@ -2144,6 +2188,104 @@ class LLMEngine:
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args,
                                                   kwargs)
+
+    def _simple_record_continuous_timing(
+        self,
+        step_total_time: float,
+        compute_time: float,
+        scheduler_outputs: SchedulerOutputs
+    ) -> None:
+        """简化的连续时间记录 - 直接写入文件"""
+        # 只记录decode阶段的数据（没有prefill请求的批次）
+        if scheduler_outputs.num_prefill_groups > 0:
+            return
+            
+        # 统计当前批次信息
+        lora_requests_in_batch = []
+        total_sequences = 0
+        active_lora_names = set()
+        
+        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+            seq_group = scheduled_seq_group.seq_group
+            total_sequences += len(seq_group.seqs)
+            if seq_group.lora_request:
+                lora_requests_in_batch.append(seq_group.lora_request.lora_name)
+                active_lora_names.add(seq_group.lora_request.lora_name)
+        
+        unique_loras = len(active_lora_names)
+        lora_coverage = len(lora_requests_in_batch) / total_sequences if total_sequences > 0 else 0
+        overhead_time = step_total_time - compute_time
+        
+        # 创建基于当前实验设置的文件标识符
+        experiment_key = f"bs{total_sequences}_loras{unique_loras}"
+        
+        # 为每个实验设置维护独立的计数器和文件
+        if not hasattr(self, '_timing_counters'):
+            self._timing_counters = {}
+        if not hasattr(self, '_timing_files'):
+            self._timing_files = {}
+            
+        if experiment_key not in self._timing_counters:
+            self._timing_counters[experiment_key] = 0
+            
+        # 增加该实验设置的iteration计数器
+        self._timing_counters[experiment_key] += 1
+        
+        # 创建记录条目
+        import json
+        import os
+        from datetime import datetime
+        
+        record = {
+            "iteration": self._timing_counters[experiment_key],
+            "timestamp": datetime.now().isoformat(),
+            "step_total_time_ms": step_total_time * 1000,
+            "compute_time_ms": compute_time * 1000,
+            "overhead_time_ms": overhead_time * 1000,
+            "total_sequences": total_sequences,
+            "unique_loras": unique_loras,
+            "lora_coverage": lora_coverage,
+            "active_lora_names": list(active_lora_names)
+        }
+        
+        # 确保目录存在并写入文件
+        try:
+            timing_dir = "continuous_timing_logs"
+            os.makedirs(timing_dir, exist_ok=True)
+            
+            # 为每个实验设置生成独立的文件名
+            if experiment_key not in self._timing_files:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"continuous_timing_{experiment_key}_{timestamp}.jsonl"
+                self._timing_files[experiment_key] = os.path.join(timing_dir, filename)
+                
+                # 写入头部信息
+                header = {
+                    "type": "experiment_start",
+                    "timestamp": timestamp,
+                    "experiment_config": {
+                        "batch_size": total_sequences,
+                        "num_loras": unique_loras,
+                        "lora_names": list(active_lora_names) if active_lora_names else []
+                    },
+                    "model_config": {
+                        "model_name": getattr(self.model_config, 'model', 'unknown'),
+                        "dtype": str(self.model_config.dtype),
+                        "max_model_len": self.model_config.max_model_len,
+                    }
+                }
+                with open(self._timing_files[experiment_key], 'w', encoding='utf-8') as f:
+                    f.write(json.dumps(header, ensure_ascii=False) + '\n')
+                
+                logger.info(f"开始连续时间记录 [{experiment_key}]: {self._timing_files[experiment_key]}")
+            
+            # 写入记录到对应的文件
+            with open(self._timing_files[experiment_key], 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                
+        except Exception as e:
+            # 静默处理错误，不影响正常推理
+            logger.debug(f"连续时间记录写入失败: {e}")
 
 
 if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
