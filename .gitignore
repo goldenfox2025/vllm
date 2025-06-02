@@ -1225,3 +1225,15 @@ test_punica_kernel.py
 throughput_heatmap.png
 throughput_vs_batch_size.png
 throughput_vs_output_length.png
+
+
+continuous_timing_logs
+ncu_reports
+hf_models
+LoRA_Punica_Parameter_Processing_Guide.md
+vllm_lora_pointer_array_fix.md
+vllm_strict_consistency_mode.md
+vllm_prefix_cache_deep_dive.md
+vllm_page_attention_analysis.md
+vllm_prefix_cache_detailed_analysis.md
+vllm_lora_stack_analysis.md

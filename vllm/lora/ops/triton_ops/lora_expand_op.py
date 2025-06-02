@@ -171,8 +171,8 @@ def _lora_expand(
 
     assert inputs.dtype in [torch.float16, torch.bfloat16, torch.float32]
     for weight in lora_b_weights:
-        assert weight.dtype in [torch.float16, torch.bfloat16]
-
+        assert weight.dtype in [torch.bfloat16]
+    
     assert inputs.size(0) == len(lora_b_weights)
     assert output_tensor.is_contiguous()
 
@@ -206,7 +206,7 @@ def _lora_expand(
     EVEN_K = K % BLOCK_K == 0  # type: ignore
 
     if inputs.dtype == torch.float32 and lora_b_weights[0].dtype in [
-            torch.float16,
+   
             torch.bfloat16,
     ]:
         CAST_TYPE = True
@@ -214,6 +214,22 @@ def _lora_expand(
     # TODO (varun): This grid formulation maximizes parallelization at the
     # cost of wasteful thread block launch when only a few input tokens require
     # LoRA. This might not be the best in all cases.
+
+    if not hasattr(_lora_expand, '_param_debug_printed'):
+        print(f"\n🔍 EXPAND KERNEL PARAMETERS:")
+        print(f"   M (num_tokens): {M}")
+        print(f"   MAX_N (hidden_size): {MAX_N}")
+        print(f"   K (lora_rank): {K}")
+        print(f"   NUM_SLICES: {NUM_SLICES}")
+        print(f"   MAX_LORAS: {MAX_LORAS}")
+        print(f"   BLOCK_M: {BLOCK_M}, BLOCK_N: {BLOCK_N}, BLOCK_K: {BLOCK_K}")
+        
+        # 计算grid
+        grid_x = triton.cdiv(M, BLOCK_M) * triton.cdiv(MAX_N, BLOCK_N)
+        print(f"   Grid calculation: {triton.cdiv(M, BLOCK_M)} * {triton.cdiv(MAX_N, BLOCK_N)} = {grid_x}")
+        print(f"   Final grid: ({grid_x}, {NUM_SLICES}, {MAX_LORAS})")
+        _lora_expand._param_debug_printed = True
+
     grid = (
         triton.cdiv(M, BLOCK_M) * triton.cdiv(MAX_N, BLOCK_N),
         NUM_SLICES,

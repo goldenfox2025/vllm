@@ -135,6 +135,17 @@ def _lora_shrink(
         # None of the inputs require LoRA.
         return
 
+    # Debug: Print Triton input/output info (only first call)
+    if not hasattr(_lora_shrink, '_debug_printed'):
+        print("🔍 TRITON DEBUG - First call:")
+        print(f"   inputs: shape={inputs.shape}, dtype={inputs.dtype}, ptr=0x{inputs.data_ptr():x}")
+        print(f"   output: shape={output_tensor.shape}, dtype={output_tensor.dtype}, ptr=0x{output_tensor.data_ptr():x}")
+        print(f"   lora_a[0]: shape={lora_a_weights[0].shape}, dtype={lora_a_weights[0].dtype}, ptr=0x{lora_a_weights[0].data_ptr():x}")
+        print(f"   token_indices_sorted: {token_indices_sorted_by_lora_ids[:10].tolist()}")
+        print(f"   inputs sample (first 4): {inputs[0, :4].tolist()}")
+        print(f"   output before (first 4): {output_tensor[0, 0, :4].tolist()}")
+        _lora_shrink._debug_printed = True
+
     assert inputs.dtype == lora_a_weights[0].dtype
     assert inputs.dtype in [torch.float16, torch.bfloat16]
     for weight in lora_a_weights:
@@ -172,6 +183,25 @@ def _lora_shrink(
     # TODO (varun): This grid formulation maximizes parallelization at the
     # cost of wasteful thread block launch when only few of the input tokens
     # require LoRA. This might not be the best in all cases.
+   
+
+    # 🔍 调试：打印实际参数
+    if not hasattr(_lora_shrink, '_param_debug_printed'):
+        print(f"\n🔍 SHRINK KERNEL PARAMETERS:")
+        print(f"   M (num_tokens): {M}")
+        print(f"   N (lora_rank): {N}")
+        print(f"   K (hidden_size): {K}")
+        print(f"   NUM_SLICES: {NUM_SLICES}")
+        print(f"   MAX_LORAS: {MAX_LORAS}")
+        print(f"   BLOCK_M: {BLOCK_M}, BLOCK_N: {BLOCK_N}, BLOCK_K: {BLOCK_K}")
+        print(f"   SPLIT_K: {SPLIT_K}")
+        
+        # 计算grid
+        grid_x = SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+        print(f"   Grid calculation: {SPLIT_K} * {triton.cdiv(M, BLOCK_M)} * {triton.cdiv(N, BLOCK_N)} = {grid_x}")
+        print(f"   Final grid: ({grid_x}, {NUM_SLICES}, {MAX_LORAS})")
+        _lora_shrink._param_debug_printed = True
+
     grid = (
         SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
         NUM_SLICES,
@@ -211,6 +241,13 @@ def _lora_shrink(
         num_ctas=NUM_CTAS,
         num_stages=NUM_STAGES,
     )
+
+    # Debug: Print Triton output info (only first call)
+    if hasattr(_lora_shrink, '_debug_printed') and not hasattr(_lora_shrink, '_output_printed'):
+        print("🔍 TRITON DEBUG - After execution:")
+        print(f"   output after (first 4): {output_tensor[0, 0, :4].tolist()}")
+        print(f"   output sample [0,1,:4]: {output_tensor[0, 1, :4].tolist()}")
+        _lora_shrink._output_printed = True
 
     return
 
