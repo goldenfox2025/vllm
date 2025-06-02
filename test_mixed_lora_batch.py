@@ -70,7 +70,7 @@ def test_mixed_lora_batch():
     print(f"✅ 单个LoRA批处理完成，生成了{len(single_outputs)}个输出")
     
     # 测试2: 混合LoRA批处理（关键测试）
-    print(f"📊 测试2: 混合LoRA批处理 - 这里应该看到2048 tokens!")
+    print(f"📊 测试2: 混合LoRA批处理")
     mixed_prompts = [
         "Hello, how are you?",                          # LoRA 1
         "Write a short story about a robot.",           # LoRA 2
