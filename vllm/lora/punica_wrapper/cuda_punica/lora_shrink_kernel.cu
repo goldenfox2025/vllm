@@ -12,9 +12,9 @@ constexpr int BLOCK_K = 32;
 
 template <typename InputT, typename OutputT>
 __global__ void lora_shrink_kernel_triton_style(
-    const InputT* __restrict__ input,   // [num_tokens, hidden_size]
-    const InputT* __restrict__ lora_a,  // [num_loras, lora_rank, hidden_size]
-    OutputT* __restrict__ output,       // [num_slices, num_tokens, lora_rank]
+    const InputT* __restrict__ input,           // [num_tokens, hidden_size]
+    const void* __restrict__ lora_a_ptr_array,  // 指向每个slice权重的指针数组
+    OutputT* __restrict__ output,  // [num_slices, num_tokens, lora_rank]
     const int* __restrict__ token_indices_sorted,  // [num_tokens] - 按 LoRA ID
                                                    // 排序的 token 索引
     const int* __restrict__ lora_ids,  // [max_loras] - LoRA ID 列表
@@ -42,9 +42,11 @@ __global__ void lora_shrink_kernel_triton_style(
   int cta_n_num = (N + BLOCK_N - 1) / BLOCK_N;
   int cta_m_num = (M + BLOCK_M - 1) / BLOCK_M;
 
-  // 当前线程块处理的数据
-  int cta_m_idx = blockIdx.x % cta_m_num;
-  int cta_n_idx = blockIdx.x / cta_m_num % cta_n_num;
+  int SPLIT_K = 1;
+  int pid_sk_m_n = blockIdx.x;
+  int pid_sk = pid_sk_m_n % SPLIT_K;
+  int cta_m_idx = (pid_sk_m_n / SPLIT_K) % cta_m_num;
+  int cta_n_idx = pid_sk_m_n / (SPLIT_K * cta_m_num) % cta_n_num;
 
   /*
   MergedQKVParallelLinearWithLoRA是vllm内部的合并层
@@ -61,6 +63,18 @@ __global__ void lora_shrink_kernel_triton_style(
   int lora_id = lora_ids[lora_idx];
   if (lora_id == -1) {
     return;
+  }
+
+  const InputT* cur_lora_ptr;
+  if (num_slices == 1) {
+    // 单个slice情况：直接使用权重指针
+    cur_lora_ptr = reinterpret_cast<const InputT*>(lora_a_ptr_array);
+  } else {
+    // 多个slice情况：从指针数组中获取
+    const int64_t* ptr_values =
+        reinterpret_cast<const int64_t*>(lora_a_ptr_array);
+    uintptr_t ptr_value = static_cast<uintptr_t>(ptr_values[slice_id]);
+    cur_lora_ptr = reinterpret_cast<const InputT*>(ptr_value);
   }
 
   int lora_m_size = num_tokens_per_lora[lora_idx];
@@ -116,9 +130,12 @@ __global__ void lora_shrink_kernel_triton_style(
             InputT input_val = input[actual_token_idx * input_d0_stride +
                                      k_global * input_d1_stride];
 
-            InputT lora_val =
-                lora_a[slice_id * lora_d0_stride + rank_idx * lora_d1_stride +
-                       k_global * lora_d2_stride];
+            // Triton版本使用: cur_lora_ptr + lora_d0_stride * lora_index + ...
+            // cur_lora_ptr已经指向当前slice的权重，权重布局: [num_loras,
+            // lora_rank, hidden_size]
+            InputT lora_val = cur_lora_ptr[lora_id * lora_d0_stride +
+                                           rank_idx * lora_d1_stride +
+                                           k_global * lora_d2_stride];
 
             // 累加
             accumulator +=
@@ -153,7 +170,7 @@ __global__ void lora_shrink_kernel_triton_style(
 
 template <typename InputT, typename OutputT>
 void lora_shrink_kernel_impl(
-    const InputT* input, const InputT* lora_a, OutputT* output,
+    const InputT* input, const void* lora_a_ptr_array, OutputT* output,
     const int* token_indices_sorted, const int* lora_ids,
     const int* num_tokens_per_lora, const int* lora_token_start_loc,
     int max_active_loras, int M, int N, int K, int num_slices, float scaling,
@@ -164,14 +181,16 @@ void lora_shrink_kernel_impl(
   int cta_m_num = (M + BLOCK_M - 1) / BLOCK_M;
   int cta_n_num = (N + BLOCK_N - 1) / BLOCK_N;
 
-  // Grid: (cta_m_num * cta_n_num, num_slices, max_active_loras)
-  dim3 grid(cta_m_num * cta_n_num, num_slices, max_active_loras + 1);
+  // Triton grid: (SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+  // NUM_SLICES, MAX_LORAS) 这里假设SPLIT_K=1，与Triton的默认配置一致
+  int SPLIT_K = 1;
+  dim3 grid(SPLIT_K * cta_m_num * cta_n_num, num_slices, max_active_loras);
 
   // Block: (BLOCK_N, BLOCK_M) - 与 Triton 的 block 大小一致
   dim3 block(BLOCK_N, BLOCK_M);
 
   lora_shrink_kernel_triton_style<InputT, OutputT><<<grid, block, 0, stream>>>(
-      input, lora_a, output, token_indices_sorted, lora_ids,
+      input, lora_a_ptr_array, output, token_indices_sorted, lora_ids,
       num_tokens_per_lora, lora_token_start_loc, M, N, K, num_slices, scaling,
       input_d0_stride, input_d1_stride, lora_d0_stride, lora_d1_stride,
       lora_d2_stride, output_d0_stride, output_d1_stride, output_d2_stride);
@@ -184,7 +203,7 @@ void lora_shrink_kernel_impl(
 }
 
 void launch_lora_shrink_kernel(
-    const void* input_ptr, const void* lora_a_ptr, void* output_ptr,
+    const void* input_ptr, const void* lora_a_ptr_array, void* output_ptr,
     const int* token_indices_sorted_ptr, const int* lora_ids_ptr,
     const int* num_tokens_per_lora_ptr, const int* lora_token_start_loc_ptr,
     int max_active_loras, int num_total_tokens_in_batch, int hidden_size,
@@ -198,28 +217,25 @@ void launch_lora_shrink_kernel(
 
   if (input_dtype == 0 && output_dtype == 2) {  // half -> float
     lora_shrink_kernel_impl<half, float>(
-        static_cast<const half*>(input_ptr),
-        static_cast<const half*>(lora_a_ptr), static_cast<float*>(output_ptr),
-        token_indices_sorted_ptr, lora_ids_ptr, num_tokens_per_lora_ptr,
-        lora_token_start_loc_ptr, max_active_loras, M, N, K, num_slices, scale,
-        input_stride, 1,                                    // input strides
+        static_cast<const half*>(input_ptr), lora_a_ptr_array,
+        static_cast<float*>(output_ptr), token_indices_sorted_ptr, lora_ids_ptr,
+        num_tokens_per_lora_ptr, lora_token_start_loc_ptr, max_active_loras, M,
+        N, K, num_slices, scale, input_stride, 1,           // input strides
         lora_stride_0, lora_stride_1, lora_stride_2,        // lora strides
         output_stride_0, output_stride_1, output_stride_2,  // output strides
         stream);
   } else if (input_dtype == 0 && output_dtype == 0) {  // half -> half
     lora_shrink_kernel_impl<half, half>(
-        static_cast<const half*>(input_ptr),
-        static_cast<const half*>(lora_a_ptr), static_cast<half*>(output_ptr),
-        token_indices_sorted_ptr, lora_ids_ptr, num_tokens_per_lora_ptr,
-        lora_token_start_loc_ptr, max_active_loras, M, N, K, num_slices, scale,
-        input_stride, 1,                                    // input strides
+        static_cast<const half*>(input_ptr), lora_a_ptr_array,
+        static_cast<half*>(output_ptr), token_indices_sorted_ptr, lora_ids_ptr,
+        num_tokens_per_lora_ptr, lora_token_start_loc_ptr, max_active_loras, M,
+        N, K, num_slices, scale, input_stride, 1,           // input strides
         lora_stride_0, lora_stride_1, lora_stride_2,        // lora strides
         output_stride_0, output_stride_1, output_stride_2,  // output strides
         stream);
   } else if (input_dtype == 1 && output_dtype == 2) {  // bf16 -> float
     lora_shrink_kernel_impl<__nv_bfloat16, float>(
-        static_cast<const __nv_bfloat16*>(input_ptr),
-        static_cast<const __nv_bfloat16*>(lora_a_ptr),
+        static_cast<const __nv_bfloat16*>(input_ptr), lora_a_ptr_array,
         static_cast<float*>(output_ptr), token_indices_sorted_ptr, lora_ids_ptr,
         num_tokens_per_lora_ptr, lora_token_start_loc_ptr, max_active_loras, M,
         N, K, num_slices, scale, input_stride, 1,           // input strides

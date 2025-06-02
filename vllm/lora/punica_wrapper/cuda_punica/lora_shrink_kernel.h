@@ -35,11 +35,10 @@
  * @param output_stride_2: Third stride for output tensor
  */
 void launch_lora_shrink_kernel(
-    const void* input_ptr, const void* lora_a_ptr, void* output_ptr,
+    const void* input_ptr, const void* lora_a_ptr_array, void* output_ptr,
     const int* token_indices_sorted_ptr, const int* lora_ids_ptr,
     const int* num_tokens_per_lora_ptr, const int* lora_token_start_loc_ptr,
-    int max_active_loras,  // 需要知道活跃 LoRA 的数量
-    // --- 原始参数 ---
+    int max_active_loras,           // 需要知道活跃 LoRA 的数量
     int num_total_tokens_in_batch,  // 原来的 num_tokens
     int hidden_size, int lora_rank,
     // int num_loras, (由 max_active_loras 替代)

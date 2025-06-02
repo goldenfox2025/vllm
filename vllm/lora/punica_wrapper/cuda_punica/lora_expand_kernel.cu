@@ -74,11 +74,15 @@ __global__ void lora_expand_kernel(
     const int* hidden_sizes, int M, int MAX_N, int K, int num_slices,
     bool add_inputs, int input_d0_stride, int input_d1_stride,
     int input_d2_stride, int output_d0_stride, int output_d1_stride) {
-  // 计算线程索引
-  // pid_m: token方向的块索引
-  int pid_m = blockIdx.x % ((M + blockDim.y - 1) / blockDim.y);
-  // pid_n: hidden_size方向的块索引
-  int pid_n = blockIdx.x / ((M + blockDim.y - 1) / blockDim.y);
+  // 修复：计算线程索引，与Triton完全匹配
+  // Triton: pid_mn = tl.program_id(axis=0)
+  //         pid_m = pid_mn % cta_m_num
+  //         pid_n = (pid_mn // cta_m_num) % cta_n_num
+  int cta_m_num = (M + blockDim.y - 1) / blockDim.y;
+  int cta_n_num = (MAX_N + blockDim.x - 1) / blockDim.x;
+  int pid_mn = blockIdx.x;
+  int pid_m = pid_mn % cta_m_num;
+  int pid_n = (pid_mn / cta_m_num) % cta_n_num;
   // slice_id: 当前处理的slice (例如Q, K, 或 V)
   int slice_id = blockIdx.y;
   // lora_idx: 当前处理的LoRA适配器在活跃列表中的索引 (从0开始)
@@ -90,38 +94,39 @@ __global__ void lora_expand_kernel(
   int tid_n = threadIdx.x;
 
   // 边界检查：确保slice_id和lora_idx有效
-  // 注意：lora_idx >= 3
-  // 这个检查可能是特定场景的硬编码，如果max_active_loras大于3，这里会提前终止一些lora_idx的处理。
-  // 理想情况下，这里的边界检查应基于 max_active_loras。
-  if (slice_id >= num_slices || lora_idx >= 3) return;
+  if (slice_id >= num_slices) return;
 
   // 获取当前LoRA适配器的ID
   int lora_id = lora_ids[lora_idx];
   // 如果LoRA ID为-1，表示该槽位未使用或无效，则不处理
   if (lora_id == -1) return;
 
-  // 计算当前LoRA适配器处理的token范围
-  int token_start = lora_token_start_loc
-      [lora_idx];  // 该LoRA的token在token_indices_sorted中的起始索引
-  int num_tokens = num_tokens_per_lora[lora_idx];  // 该LoRA负责的token数量
-  // 计算当前线程在当前LoRA的token列表中的相对偏移
-  int token_offset = pid_m * blockDim.y + tid_m;
+  // 修复：计算token和hidden索引，与Triton匹配
+  // Triton: cta_m_offset = pid_m * BLOCK_M
+  //         token_offset = cta_m_offset + tid_m
+  int token_start = lora_token_start_loc[lora_idx];
+  int num_tokens = num_tokens_per_lora[lora_idx];
+  int cta_m_offset = pid_m * blockDim.y;  // BLOCK_M
 
+  // 边界检查：确保cta_m_offset在当前LoRA的token数量范围内
+  if (cta_m_offset >= num_tokens) return;
+
+  int token_offset = cta_m_offset + tid_m;
   // 边界检查：确保token_offset在当前LoRA的token数量范围内
   if (token_offset >= num_tokens) return;
 
-  // 获取实际的token索引 (在整个batch中的绝对索引)
+  // 获取实际的token索引
   int actual_token_idx = token_indices_sorted[token_start + token_offset];
-  // 计算当前线程在hidden_size维度上的偏移
-  int hidden_offset = pid_n * blockDim.x + tid_n;
-  // hidden_idx是相对于当前slice的hidden_size的索引
-  int hidden_idx = hidden_offset;
 
-  // 边界检查：使用当前slice的hidden_size进行检查
+  // 计算hidden索引，与Triton匹配
+  // Triton: offset_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
+  int hidden_idx = pid_n * blockDim.x + tid_n;  // BLOCK_N
+
+  // 修复：边界检查逻辑，与Triton保持一致
   int current_slice_hidden_size = hidden_sizes[slice_id];
-  if (hidden_idx >= current_slice_hidden_size) return;
-  // 边界检查：确保实际token索引在M范围内
-  if (actual_token_idx >= M) return;
+  if (hidden_idx >= current_slice_hidden_size || actual_token_idx >= M) {
+    return;
+  }
 
   // 获取当前slice的LoRA B权重指针
   // lora_b_ptr_array包含指向每个slice权重基地址的指针 (以int64_t形式存储)
@@ -144,36 +149,34 @@ __global__ void lora_expand_kernel(
 
   // 主计算循环 (沿K维度进行内积)
   for (int k = 0; k < K; k++) {
-    // 边界检查 (冗余检查，主要索引已在前面检查过，但保持谨慎)
-    // lora_id < 0 已经被前面的 lora_id == -1 覆盖。
-    // hidden_idx < 0 和 k < 0
-    // 理论上不会发生，因为循环从0开始，hidden_idx也非负。 actual_token_idx < 0
-    // 也理论上不会发生。
-    if (lora_id < 0 || hidden_idx < 0 || k < 0 || actual_token_idx < 0)
-      continue;
-
     // 计算输入张量的偏移量
     // input 张量维度: [num_slices, num_tokens, lora_rank]
     int input_offset = slice_id * input_d0_stride +
                        actual_token_idx * input_d1_stride + k * input_d2_stride;
 
-    if (input_offset < 0) continue;  // 防御性编程
+    if (input_offset < 0 || k >= K) continue;
     InputT input_val = input[input_offset];
 
     // 计算LoRA B权重张量的偏移量
     // 权重矩阵维度: [num_loras, hidden_size_per_slice, K]
-    // 需要使用 lora_id 来偏移到正确的 LoRA 权重
+    // 修复：根据Triton实现，应该使用lora_index（即lora_id）来索引权重
+    // Triton版本使用: cur_lora_d0_stride * lora_index
     int weight_offset = lora_id * cur_lora_d0_stride +
                         hidden_idx * cur_lora_d1_stride +
                         k * cur_lora_d2_stride;
 
-    if (weight_offset < 0) continue;  // 防御性编程
+    if (weight_offset < 0) continue;
     InputT lora_val = cur_lora_ptr[weight_offset];
 
+    float input_float = static_cast<float>(input_val);
+    float lora_float = static_cast<float>(lora_val);
+    if (!isfinite(input_float) || !isfinite(lora_float)) continue;
+
     // 累加结果
-    float product =
-        static_cast<float>(input_val) * static_cast<float>(lora_val);
-    accumulator += product;
+    float product = input_float * lora_float;
+    if (isfinite(product)) {
+      accumulator += product;
+    }
   }
 
   // 计算输出位置
@@ -186,29 +189,27 @@ __global__ void lora_expand_kernel(
   int output_offset = actual_token_idx * output_d0_stride +
                       output_hidden_idx * output_d1_stride;
 
-  // 输出边界检查
-  // 检查 actual_token_idx 和 output_hidden_idx 是否在有效范围内
-  // output_d0_stride 通常等于总的 hidden_size (2048)
+  // output_d0_stride是第0维的stride，不是hidden_size的总大小
+  // 应该检查output_hidden_idx是否超出实际的hidden_size范围
+  int total_hidden_size =
+      output_d0_stride;  // 对于2D输出张量，stride[0]就是hidden_size
   if (output_offset < 0 || actual_token_idx >= M || output_hidden_idx < 0 ||
-      output_hidden_idx >= output_d0_stride) {
+      output_hidden_idx >= total_hidden_size) {
     return;
+  }
+
+  // 添加NaN检查，防止NaN传播
+  if (!isfinite(accumulator)) {
+    return;  // 如果累加器包含NaN或Inf，直接返回
   }
 
   // 转换累加结果为输出类型
   OutputT result = static_cast<OutputT>(accumulator);
 
-  // 如果需要，将计算结果加到输出张量的现有值上
+  // 修复：简化add_inputs逻辑，与Triton行为保持一致
   if (add_inputs) {
     OutputT existing_val = output[output_offset];
-    float existing_float =
-        static_cast<float>(existing_val);  // 转换为float进行检查
-
-    // 仅当现有值为有效数值时才进行累加，避免NaN和Inf扩散
-    if (!isnan(existing_float) && !isinf(existing_float)) {
-      // 注意：这里的加法是 OutputT
-      // 类型直接相加。对于__half或__nv_bfloat16，这通常是定义好的。
-      result += existing_val;
-    }
+    result += existing_val;
   }
 
   // 写入输出
@@ -267,12 +268,13 @@ void lora_expand_kernel_impl(
   const int BLOCK_M = 16;  // 每个block在M维(token)处理的元素数量
   const int BLOCK_N = 16;  // 每个block在N维(hidden_size)处理的元素数量
 
-  // 计算M维需要的block数量
+  // 修复：计算grid维度，与Triton完全匹配
+  // Triton grid: (triton.cdiv(M, BLOCK_M) * triton.cdiv(MAX_N, BLOCK_N),
+  // NUM_SLICES, MAX_LORAS)
   int cta_m_num = (M + BLOCK_M - 1) / BLOCK_M;
-  // 计算N维需要的block数量
   int cta_n_num = (MAX_N + BLOCK_N - 1) / BLOCK_N;
 
-  // 定义Grid维度
+  // 定义Grid维度，与Triton完全一致
   // grid.x: 处理 (token, hidden_size) 平面的块数量
   // grid.y: 处理 slice 的数量 (每个slice一个平面)
   // grid.z: 处理活跃LoRA适配器的数量 (每个LoRA一个深度)

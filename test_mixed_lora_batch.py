@@ -40,7 +40,7 @@ def test_mixed_lora_batch():
         enforce_eager=True,
         disable_custom_all_reduce=True,
         trust_remote_code=True,
-        max_num_seqs=8,    # 增大batch size
+        max_num_seqs=12,    # 增大batch size
     )
     
     # 创建LoRA请求

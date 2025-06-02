@@ -168,13 +168,20 @@ def cuda_lora_shrink_triton_interface(
         if (len(set(lora_strides_d1)) > 1 or len(set(lora_strides_d2)) > 1):
             raise RuntimeError(f"LoRA weight stride inconsistency detected")
 
-        # Create continuous 3D tensor
+        # 修复：创建指针数组，与Triton的_get_lora_a_ptr完全一致
+        tensor_ptrs = []
+        for weight in processed_weights:
+            tensor_ptrs.append(weight.data_ptr())
+
         if len(processed_weights) == 1:
-            lora_3d = processed_weights[0].unsqueeze(0)  # [1, lora_rank, hidden_size]
-            lora_ptr_value = lora_3d.data_ptr()
+            # 单个slice情况：直接使用权重张量
+            lora_ptr_value = processed_weights[0].data_ptr()
+            lora_3d = processed_weights[0].unsqueeze(0)  # 用于stride计算
         else:
-            lora_3d = torch.stack(processed_weights, dim=0)  # [num_loras, lora_rank, hidden_size]
-            lora_ptr_value = lora_3d.data_ptr()
+            # 多个slice情况：创建指针数组张量，与Triton一致
+            lora_ptr_tensor = torch.tensor(tensor_ptrs, dtype=torch.int64, device=inputs.device)
+            lora_ptr_value = lora_ptr_tensor.data_ptr()
+            lora_3d = torch.stack(processed_weights, dim=0)  # 用于stride计算
 
         # Get data pointers
         input_ptr = inputs.data_ptr()
