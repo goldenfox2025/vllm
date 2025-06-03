@@ -298,7 +298,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                 )
 
                 # 使用 Triton 结果（作为参考标准）
-                y.copy_(y_triton)
+                y.copy_(y_cuda)
                 return
             else:
                 print("⚠️  CUDA LoRA shrink 失败，使用 Triton 结果")
@@ -496,8 +496,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                     y_triton, y_cuda, "LoRA Expand", rtol=1e-1, atol=1e-1
                 )
 
-                # 使用 Triton 结果（作为参考标准）
-                y.copy_(y_triton)
+           
+                y.copy_(y_cuda)
             else:
                 print("⚠️  CUDA LoRA expand 失败")
                 y.copy_(y_triton)
