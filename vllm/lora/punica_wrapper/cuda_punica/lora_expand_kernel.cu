@@ -74,7 +74,7 @@ __global__ void lora_expand_kernel(
     const int* hidden_sizes, int M, int MAX_N, int K, int num_slices,
     bool add_inputs, int input_d0_stride, int input_d1_stride,
     int input_d2_stride, int output_d0_stride, int output_d1_stride) {
-  // 修复：计算线程索引，与Triton完全匹配
+
   // Triton: pid_mn = tl.program_id(axis=0)
   //         pid_m = pid_mn % cta_m_num
   //         pid_n = (pid_mn // cta_m_num) % cta_n_num
@@ -101,7 +101,7 @@ __global__ void lora_expand_kernel(
   // 如果LoRA ID为-1，表示该槽位未使用或无效，则不处理
   if (lora_id == -1) return;
 
-  // 修复：计算token和hidden索引，与Triton匹配
+
   // Triton: cta_m_offset = pid_m * BLOCK_M
   //         token_offset = cta_m_offset + tid_m
   int token_start = lora_token_start_loc[lora_idx];
@@ -122,7 +122,7 @@ __global__ void lora_expand_kernel(
   // Triton: offset_n = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
   int hidden_idx = pid_n * blockDim.x + tid_n;  // BLOCK_N
 
-  // 修复：边界检查逻辑，与Triton保持一致
+
   int current_slice_hidden_size = hidden_sizes[slice_id];
   if (hidden_idx >= current_slice_hidden_size || actual_token_idx >= M) {
     return;
@@ -134,8 +134,9 @@ __global__ void lora_expand_kernel(
       reinterpret_cast<const int64_t*>(lora_b_ptr_array);
   // 根据slice_id获取对应slice的权重基地址 (uintptr_t)
   uintptr_t ptr_value = static_cast<uintptr_t>(ptr_values[slice_id]);
-  // 将地址转换为实际的输入类型指针
-  const InputT* cur_lora_ptr = reinterpret_cast<const InputT*>(ptr_value);
+
+  const __nv_bfloat16* cur_lora_ptr =
+      reinterpret_cast<const __nv_bfloat16*>(ptr_value);
 
   // 获取当前slice的LoRA B权重矩阵的内存步长
   int cur_lora_d0_stride = lora_strides_d0[slice_id];  // LoRA ID维度的stride
@@ -166,7 +167,7 @@ __global__ void lora_expand_kernel(
                         k * cur_lora_d2_stride;
 
     if (weight_offset < 0) continue;
-    InputT lora_val = cur_lora_ptr[weight_offset];
+    __nv_bfloat16 lora_val = cur_lora_ptr[weight_offset];
 
     float input_float = static_cast<float>(input_val);
     float lora_float = static_cast<float>(lora_val);
@@ -206,7 +207,6 @@ __global__ void lora_expand_kernel(
   // 转换累加结果为输出类型
   OutputT result = static_cast<OutputT>(accumulator);
 
-  // 修复：简化add_inputs逻辑，与Triton行为保持一致
   if (add_inputs) {
     OutputT existing_val = output[output_offset];
     result += existing_val;
@@ -264,9 +264,11 @@ void lora_expand_kernel_impl(
     int num_slices, bool add_inputs, int input_d0_stride, int input_d1_stride,
     int input_d2_stride, int output_d0_stride, int output_d1_stride,
     cudaStream_t stream) {
-  // Grid 和 Block 配置
+  // 修复：Grid 和 Block 配置，使用GPU兼容的配置
+  // Triton使用BLOCK_M=64, BLOCK_N=128，但CUDA需要考虑线程数限制
+  // 最大线程数通常是1024，所以使用较小的block配置
   const int BLOCK_M = 16;  // 每个block在M维(token)处理的元素数量
-  const int BLOCK_N = 16;  // 每个block在N维(hidden_size)处理的元素数量
+  const int BLOCK_N = 32;  // 每个block在N维(hidden_size)处理的元素数量
 
   // 修复：计算grid维度，与Triton完全匹配
   // Triton grid: (triton.cdiv(M, BLOCK_M) * triton.cdiv(MAX_N, BLOCK_N),
