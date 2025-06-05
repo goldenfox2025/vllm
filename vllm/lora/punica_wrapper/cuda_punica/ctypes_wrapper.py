@@ -218,13 +218,10 @@ def cuda_lora_shrink_triton_interface(
         num_tokens_per_lora_ptr = num_tokens_per_lora.data_ptr()
         lora_token_start_loc_ptr = lora_token_start_loc.data_ptr()
 
-        # Calculate actual number of active LoRAs (exclude -1 padding)
-        active_lora_count = 0
-        for lora_id in lora_ids.tolist():
-            if lora_id != -1:
-                active_lora_count += 1
-        max_active_loras = active_lora_count
 
+        active_lora_count = sum(1 for lora_id in lora_ids.tolist())
+        max_active_loras = active_lora_count
+        
         # Call the C function with multi-LoRA support
         result = cuda_c_lib.cuda_lora_shrink_c(
             input_ptr,

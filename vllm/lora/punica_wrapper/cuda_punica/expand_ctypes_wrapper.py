@@ -163,7 +163,7 @@ def cuda_lora_expand_triton_interface(
             return False
 
         # Calculate active LoRA count
-        active_lora_count = sum(1 for lora_id in lora_ids.tolist() if lora_id != -1)
+        active_lora_count = sum(1 for lora_id in lora_ids.tolist())
         max_active_loras = active_lora_count
 
         # Call the CUDA kernel

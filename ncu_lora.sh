@@ -22,7 +22,7 @@ echo ""
 # Focus on triton kernels and skip some initial launches to avoid warmup
 ncu \
     --kernel-name "regex:.*(lora|triton).*" \
-    --launch-skip 1500 \
+    --launch-skip 200 \
     --launch-count 30 \
     --set full \
     --export "ncu_reports/${REPORT_NAME}" \

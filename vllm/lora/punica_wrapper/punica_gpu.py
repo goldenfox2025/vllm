@@ -462,7 +462,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         assert x.size(0) == len(output_slices)
         num_tokens = x.size(1)  # first dimension is the num slices
 
-        # 如果 CUDA 和 Triton 都可用，则先调用 Triton，再调用 CUDA，对比结果
+     
         if CUDA_LORA_AVAILABLE and HAS_TRITON :
             # 1. 先调用 Triton 实现
             y_triton = y.clone()  # 保存 Triton 结果

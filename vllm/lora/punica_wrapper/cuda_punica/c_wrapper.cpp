@@ -19,17 +19,14 @@ int cuda_lora_shrink_c(
     int max_active_loras,           // Number of active LoRAs
     int num_total_tokens, int hidden_size, int lora_rank, int num_slices,
     float scale,
-    // Strides
+
     int input_stride0, int lora_stride0, int lora_stride1, int lora_stride2,
     int output_stride0, int output_stride1, int output_stride2,
     void* stream_ptr, int input_dtype, int output_dtype) {
   try {
-    // Use default CUDA stream (0) for simplicity
-    // This is compatible with most PyTorch operations
     cudaStream_t stream = 0;
     cudaError_t err = cudaStreamSynchronize(stream);
 
-    // Launch the kernel with dtype information and multi-LoRA support
     launch_lora_shrink_kernel(
         input_ptr, lora_a_ptr, output_ptr, token_indices_sorted_ptr,
         lora_ids_ptr, num_tokens_per_lora_ptr, lora_token_start_loc_ptr,
@@ -38,10 +35,9 @@ int cuda_lora_shrink_c(
         output_stride0, output_stride1, output_stride2, stream, input_dtype,
         output_dtype);
 
-    // Ensure kernel completion
     cudaError_t sync_error = cudaStreamSynchronize(stream);
     if (sync_error != cudaSuccess) {
-      return -3;  // Synchronization error
+      return -3;
     }
 
     return 0;  // Success
