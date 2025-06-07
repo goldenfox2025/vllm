@@ -30,12 +30,15 @@ def _lora_shrink_kernel(input_ptr, lora_ptr, out_ptr, M, N, K,
     cta_m_num = tl.cdiv(M, BLOCK_M)
 
     pid_sk_m_n = tl.program_id(axis=0)
+
     pid_sk = pid_sk_m_n % SPLIT_K
     pid_m = (pid_sk_m_n // SPLIT_K) % cta_m_num
     pid_n = pid_sk_m_n // (SPLIT_K * cta_m_num) % cta_n_num
 
     slice_id = tl.program_id(axis=1)
+
     lora_idx = tl.program_id(axis=2)
+
 
     lora_id = tl.load(lora_ids + lora_idx)
     if lora_id == -1:
@@ -185,22 +188,21 @@ def _lora_shrink(
     # require LoRA. This might not be the best in all cases.
    
 
-    # 🔍 调试：打印实际参数
-    if not hasattr(_lora_shrink, '_param_debug_printed'):
-        print(f"\n🔍 SHRINK KERNEL PARAMETERS:")
-        print(f"   M (num_tokens): {M}")
-        print(f"   N (lora_rank): {N}")
-        print(f"   K (hidden_size): {K}")
-        print(f"   NUM_SLICES: {NUM_SLICES}")
-        print(f"   MAX_LORAS: {MAX_LORAS}")
-        print(f"   BLOCK_M: {BLOCK_M}, BLOCK_N: {BLOCK_N}, BLOCK_K: {BLOCK_K}")
-        print(f"   SPLIT_K: {SPLIT_K}")
-        
-        # 计算grid
-        grid_x = SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-        print(f"   Grid calculation: {SPLIT_K} * {triton.cdiv(M, BLOCK_M)} * {triton.cdiv(N, BLOCK_N)} = {grid_x}")
-        print(f"   Final grid: ({grid_x}, {NUM_SLICES}, {MAX_LORAS})")
-        _lora_shrink._param_debug_printed = True
+
+    print(f"\n SHRINK KERNEL PARAMETERS:")
+    print(f"   M (num_tokens): {M}")
+    print(f"   N (lora_rank): {N}")
+    print(f"   K (hidden_size): {K}")
+    print(f"   NUM_SLICES: {NUM_SLICES}")
+    print(f"   MAX_LORAS: {MAX_LORAS}")
+    print(f"   BLOCK_M: {BLOCK_M}, BLOCK_N: {BLOCK_N}, BLOCK_K: {BLOCK_K}")
+    print(f"   SPLIT_K: {SPLIT_K}")
+    
+    # 计算grid
+    grid_x = SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    print(f"   Grid calculation: {SPLIT_K} * {triton.cdiv(M, BLOCK_M)} * {triton.cdiv(N, BLOCK_N)} = {grid_x}")
+    print(f"   Final grid: ({grid_x}, {NUM_SLICES}, {MAX_LORAS})")
+    _lora_shrink._param_debug_printed = True
 
     grid = (
         SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),

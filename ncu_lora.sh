@@ -20,13 +20,15 @@ echo ""
 
 # Run NCU with kernel filtering
 # Focus on triton kernels and skip some initial launches to avoid warmup
+# --kernel-name "regex:.*(lora|triton).*" \
 ncu \
     --kernel-name "regex:.*(lora|triton).*" \
-    --launch-skip 200 \
-    --launch-count 30 \
+    --target-processes all \
+    --launch-skip 300 \
+    --launch-count 10 \
+    --replay-mode kernel \
     --set full \
     --export "ncu_reports/${REPORT_NAME}" \
-    --force-overwrite \
     python3 run_vllm_lora_ncu.py
 
 echo ""

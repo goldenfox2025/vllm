@@ -39,7 +39,7 @@ def main():
         max_loras=2,       # 🔥 Support 2 LoRAs simultaneously
         max_model_len=256,  # Small context for faster execution
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.9,  # High memory usage
+        gpu_memory_utilization=0.64,  # High memory usage
         enforce_eager=True,  # Disable compilation for faster startup
         disable_custom_all_reduce=True,
         trust_remote_code=True,
