@@ -1237,3 +1237,4 @@ vllm_prefix_cache_deep_dive.md
 vllm_page_attention_analysis.md
 vllm_prefix_cache_detailed_analysis.md
 vllm_lora_stack_analysis.md
+vllm_slice.md

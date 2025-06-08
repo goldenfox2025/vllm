@@ -24,7 +24,7 @@ echo ""
 ncu \
     --kernel-name "regex:.*(lora|triton).*" \
     --target-processes all \
-    --launch-skip 300 \
+    --launch-skip 500 \
     --launch-count 10 \
     --replay-mode kernel \
     --set full \

@@ -182,7 +182,17 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        
+        # 添加调试打印信息
+        print(f"[vLLM QKV Debug - Qwen2] hidden_states shape: {hidden_states.shape}")
+        print(f"[vLLM QKV Debug - Qwen2] qkv shape after projection: {qkv.shape}")
+        print(f"[vLLM QKV Debug - Qwen2] q_size: {self.q_size}, kv_size: {self.kv_size}")
+        print(f"[vLLM QKV Debug - Qwen2] QKV权重NK顺序拼接，输出在N维度连续")
+        
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        print(f"[vLLM QKV Debug - Qwen2] after split - q: {q.shape}, k: {k.shape}, v: {v.shape}")
+        
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)

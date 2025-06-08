@@ -301,9 +301,10 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                 y.copy_(y_cuda)
                 return
             else:
-                print("⚠️  CUDA LoRA shrink 失败，使用 Triton 结果")
-                y.copy_(y_triton)
-                return
+                print("⚠️  CUDA LoRA shrink 失败，退出推理")
+                sys.exit(1)
+                # y.copy_(y_triton)
+                # return
 
         # 如果只有 Triton 可用，直接使用 Triton
         elif HAS_TRITON:
@@ -375,8 +376,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         except Exception as e:
             # Log error but don't crash - fallback to Triton
             print(f"⚠️  CUDA LoRA shrink failed: {e}")
-            import traceback
-            traceback.print_exc()
+            # import traceback
+            # traceback.print_exc()
             return False
 
     def _try_cuda_expand(self, y: torch.Tensor, x: torch.Tensor,
