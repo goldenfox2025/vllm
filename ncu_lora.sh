@@ -40,3 +40,4 @@ echo "  ncu-ui ncu_reports/${REPORT_NAME}.ncu-rep"
 echo ""
 echo "Generate summary:"
 echo "  ncu --import ncu_reports/${REPORT_NAME}.ncu-rep --page details"
+# huggingface-cli download Superrrdamn/task-13-Qwen-Qwen2.5-1.5B --local-dir .

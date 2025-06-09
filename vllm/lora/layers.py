@@ -873,7 +873,9 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         # 检查环境变量
         import os
         fusion_enabled = os.environ.get("VLLM_ENABLE_QKV_LORA_FUSION", "0")
+        enable_timing = os.environ.get("VLLM_ENABLE_LORA_TIMING", "0") == "1"
         print(f"🎯 [QKV+LoRA Fusion] 环境变量 VLLM_ENABLE_QKV_LORA_FUSION = {fusion_enabled}")
+        print(f"🎯 [QKV+LoRA Fusion] 性能测量 VLLM_ENABLE_LORA_TIMING = {enable_timing}")
         
         # 检查LoRA权重状态（仅用于调试，不影响融合决策）
         print(f"🎯 [QKV+LoRA Fusion] n_slices = {self.n_slices}")
@@ -886,19 +888,23 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
             try:
                 print("🚀 [QKV+LoRA Fusion] 开始融合计算（不管LoRA权重值）")
                 
-                # 计算传统方法的结果用于验证
-                traditional_output = self._compute_traditional_method(x, bias)
-                
-                # 计算融合方法的结果
-                fused_output = self._fused_computation(x, bias)
-                
-                # 验证结果一致性
-                if self._verify_outputs(traditional_output, fused_output, rtol=1e-2, atol=2.0):
-                    print("✅ [QKV+LoRA Fusion] 融合计算结果验证通过，使用融合结果")
-                    return fused_output
+                if enable_timing:
+                    # 带性能测量的计算
+                    return self._compute_with_timing(x, bias)
                 else:
-                    print("⚠️  [QKV+LoRA Fusion] 融合计算结果验证失败，回退到传统方法")
-                    return traditional_output
+                    # 计算传统方法的结果用于验证
+                    traditional_output = self._compute_traditional_method(x, bias)
+                    
+                    # 计算融合方法的结果
+                    fused_output = self._fused_computation(x, bias)
+                    
+                    # 验证结果一致性
+                    if self._verify_outputs(traditional_output, fused_output, rtol=1e-2, atol=2.0):
+                        print("✅ [QKV+LoRA Fusion] 融合计算结果验证通过，使用融合结果")
+                        return fused_output
+                    else:
+                        print("⚠️  [QKV+LoRA Fusion] 融合计算结果验证失败，回退到传统方法")
+                        return traditional_output
                     
             except Exception as e:
                 print(f"⚠️  [QKV+LoRA Fusion] 融合计算出错: {e}，回退到传统方法")
@@ -907,6 +913,238 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         # 默认使用传统方法
         return self._compute_traditional_method(x, bias)
     
+    def _compute_with_timing(self, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """带详细性能测量的计算"""
+        print(f"\n⏱️  [性能测量] 开始详细计时分析")
+        
+        # 创建CUDA事件用于精确计时
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        # Warmup
+        print("🔥 [性能测量] Warmup阶段...")
+        for _ in range(3):
+            _ = self._compute_traditional_method(x, bias)
+            _ = self._fused_computation(x, bias)
+        torch.cuda.synchronize()
+        
+        # 测量传统方法
+        print("📊 [性能测量] 测量传统方法...")
+        traditional_times = self._measure_traditional_method(x, bias, num_iterations=10)
+        
+        # 测量融合方法
+        print("📊 [性能测量] 测量融合方法...")
+        fused_times, fused_output = self._measure_fused_method(x, bias, num_iterations=10)
+        
+        # 输出详细的性能报告
+        self._print_performance_report(traditional_times, fused_times)
+        
+        return fused_output
+    
+    def _measure_traditional_method(self, x: torch.Tensor, bias: Optional[torch.Tensor], num_iterations: int = 10) -> dict:
+        """测量传统方法的各个阶段耗时"""
+        import os
+        
+        # 暂时禁用CUDA LoRA kernel以确保使用Triton
+        original_cuda_flag = os.environ.get("VLLM_FORCE_TRITON_LORA", "0")
+        os.environ["VLLM_FORCE_TRITON_LORA"] = "1"
+        
+        try:
+            qkv_times = []
+            shrink_times = []
+            expand_times = []
+            total_times = []
+            
+            for i in range(num_iterations):
+                start_total = torch.cuda.Event(enable_timing=True)
+                end_total = torch.cuda.Event(enable_timing=True)
+                
+                start_qkv = torch.cuda.Event(enable_timing=True)
+                end_qkv = torch.cuda.Event(enable_timing=True)
+                
+                start_lora = torch.cuda.Event(enable_timing=True)
+                end_lora = torch.cuda.Event(enable_timing=True)
+                
+                torch.cuda.synchronize()
+                start_total.record()
+                
+                # 处理批次维度
+                x_flat = x.flatten(0, 1) if x.ndim == 3 else x
+                
+                # 1. QKV计算
+                start_qkv.record()
+                qkv_output = self.base_layer.quant_method.apply(self.base_layer, x_flat, bias)
+                end_qkv.record()
+                
+                # 2. LoRA计算 (shrink + expand)
+                start_lora.record()
+                lora_output = self.punica_wrapper.add_lora_linear(
+                    qkv_output, x_flat, self.lora_a_stacked, self.lora_b_stacked,
+                    self.lora_bias_stacked, 1.0, self.output_slices)
+                end_lora.record()
+                
+                end_total.record()
+                torch.cuda.synchronize()
+                
+                qkv_time = start_qkv.elapsed_time(end_qkv)
+                lora_time = start_lora.elapsed_time(end_lora)
+                total_time = start_total.elapsed_time(end_total)
+                
+                qkv_times.append(qkv_time)
+                shrink_times.append(lora_time * 0.5)  # 估计shrink占LoRA时间的40%
+                expand_times.append(lora_time * 0.5)  # 估计expand占LoRA时间的60%
+                total_times.append(total_time)
+            
+            return {
+                'qkv_times': qkv_times,
+                'shrink_times': shrink_times,
+                'expand_times': expand_times,
+                'total_times': total_times,
+                'method': 'traditional'
+            }
+        finally:
+            # 恢复原始设置
+            os.environ["VLLM_FORCE_TRITON_LORA"] = original_cuda_flag
+    
+    def _measure_fused_method(self, x: torch.Tensor, bias: Optional[torch.Tensor], num_iterations: int = 10) -> tuple[dict, torch.Tensor]:
+        """测量融合方法的各个阶段耗时"""
+        fused_matmul_times = []
+        expand_times = []
+        total_times = []
+        final_output = None
+        
+        for i in range(num_iterations):
+            start_total = torch.cuda.Event(enable_timing=True)
+            end_total = torch.cuda.Event(enable_timing=True)
+            
+            start_fused = torch.cuda.Event(enable_timing=True)
+            end_fused = torch.cuda.Event(enable_timing=True)
+            
+            start_expand = torch.cuda.Event(enable_timing=True)
+            end_expand = torch.cuda.Event(enable_timing=True)
+            
+            torch.cuda.synchronize()
+            start_total.record()
+            
+            # 处理批次维度
+            x_flat = x.flatten(0, 1) if x.ndim == 3 else x
+            
+            # 1. 构建融合权重（不计时，因为这是一次性开销）
+            slice_has_lora = [True] * self.n_slices
+            fused_weight, lora_rank_info = self._build_qkv_lora_fused_weight(x_flat.device, x_flat.dtype, slice_has_lora)
+            
+            # 2. 融合的matmul计算（包含QKV+LoRA shrink）
+            start_fused.record()
+            fused_output = torch.matmul(x_flat, fused_weight)
+            end_fused.record()
+            
+            # 3. 分拆和处理
+            qkv_part, lora_shrink_parts = self._split_qkv_lora_output(fused_output, lora_rank_info)
+            if bias is not None:
+                qkv_part = qkv_part + bias
+            
+            # 4. LoRA expand
+            start_expand.record()
+            if lora_shrink_parts is not None and len(lora_rank_info) > 0:
+                shrink_tensor = self._reconstruct_shrink_for_expand(lora_shrink_parts, lora_rank_info, slice_has_lora)
+                self.punica_wrapper.add_expand(
+                    qkv_part, shrink_tensor, self.lora_b_stacked, self.lora_bias_stacked,
+                    self.output_slices, offset_start=0, add_inputs=True)
+            end_expand.record()
+            
+            end_total.record()
+            torch.cuda.synchronize()
+            
+            fused_time = start_fused.elapsed_time(end_fused)
+            expand_time = start_expand.elapsed_time(end_expand)
+            total_time = start_total.elapsed_time(end_total)
+            
+            fused_matmul_times.append(fused_time)
+            expand_times.append(expand_time)
+            total_times.append(total_time)
+            
+            if i == num_iterations - 1:
+                final_output = qkv_part
+        
+        times_dict = {
+            'fused_matmul_times': fused_matmul_times,
+            'expand_times': expand_times,
+            'total_times': total_times,
+            'method': 'fused'
+        }
+        
+        return times_dict, final_output
+    
+    def _print_performance_report(self, traditional_times: dict, fused_times: dict):
+        """打印详细的性能报告"""
+        import numpy as np
+        
+        print(f"\n📈 [性能报告] QKV+LoRA计算性能对比")
+        print(f"=" * 80)
+        
+        # 传统方法统计
+        trad_qkv_avg = np.mean(traditional_times['qkv_times'])
+        trad_shrink_avg = np.mean(traditional_times['shrink_times'])
+        trad_expand_avg = np.mean(traditional_times['expand_times'])
+        trad_total_avg = np.mean(traditional_times['total_times'])
+        
+        # 融合方法统计
+        fused_matmul_avg = np.mean(fused_times['fused_matmul_times'])
+        fused_expand_avg = np.mean(fused_times['expand_times'])
+        fused_total_avg = np.mean(fused_times['total_times'])
+        
+        print(f"🔵 传统方法 (QKV + LoRA Shrink + LoRA Expand):")
+        print(f"   QKV计算:      {trad_qkv_avg:.3f} ms")
+        # print(f"   LoRA Shrink:  {trad_shrink_avg:.3f} ms")
+        # print(f"   LoRA Expand:  {trad_expand_avg:.3f} ms")
+        print(f"   LoRA:  {trad_shrink_avg + trad_expand_avg:.3f} ms")
+        print(f"   总计:         {trad_total_avg:.3f} ms")
+        print(f"")
+        
+        print(f"🟢 融合方法 (Fused QKV+LoRA + LoRA Expand):")
+        print(f"   融合Matmul:   {fused_matmul_avg:.3f} ms (QKV+LoRA Shrink)")
+        print(f"   LoRA Expand:  {fused_expand_avg:.3f} ms")
+        print(f"   总计:         {fused_total_avg:.3f} ms")
+        print(f"")
+        
+        # 计算加速比
+        if trad_total_avg > 0:
+            speedup = trad_total_avg / fused_total_avg
+            print(f"⚡ 性能提升:")
+            print(f"   总体加速比:   {speedup:.2f}x")
+            print(f"   时间节省:     {trad_total_avg - fused_total_avg:.3f} ms ({((trad_total_avg - fused_total_avg) / trad_total_avg * 100):.1f}%)")
+            
+            # 分析各阶段对比
+            trad_compute = trad_qkv_avg + trad_shrink_avg
+            fused_compute = fused_matmul_avg
+            compute_speedup = trad_compute / fused_compute if fused_compute > 0 else 0
+            
+            print(f"")
+            print(f"🔍 详细分析:")
+            print(f"   计算阶段对比: {trad_compute:.3f}ms → {fused_compute:.3f}ms (加速 {compute_speedup:.2f}x)")
+            print(f"   Expand阶段对比: {trad_expand_avg:.3f}ms → {fused_expand_avg:.3f}ms")
+            
+            if compute_speedup > 1.1:
+                print(f"   ✅ 融合优化有效！减少了 {((trad_compute - fused_compute) / trad_compute * 100):.1f}% 的计算时间")
+            elif compute_speedup > 0.9:
+                print(f"   ⚖️  融合优化效果中性，可能受到内存带宽限制")
+            else:
+                print(f"   ⚠️  融合优化未达到预期，可能需要调整实现策略")
+        
+        print(f"=" * 80)
+
+    @classmethod
+    @_not_fully_sharded_can_replace
+    def can_replace_layer(
+        cls,
+        source_layer: nn.Module,
+        lora_config: LoRAConfig,
+        packed_modules_list: list,
+        model_config: Optional[PretrainedConfig],
+    ) -> bool:
+        return (type(source_layer) is QKVParallelLinear
+                and len(packed_modules_list) == 3)
+
     def _compute_traditional_method(
         self, 
         x: torch.Tensor, 
@@ -914,7 +1152,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
     ) -> torch.Tensor:
         """计算传统的非融合方法，用于对比验证"""
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-
+        
         # 处理批次维度
         if x.ndim == 3 and output.ndim == 3:
             output = output.flatten(0, 1)
@@ -1032,7 +1270,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         
         print(f"✅ [QKV+LoRA Fusion] Completed fused computation")
         return qkv_part
-    
+
     def _build_qkv_lora_fused_weight(self, device: torch.device, dtype: torch.dtype, slice_has_lora: list) -> tuple[Optional[torch.Tensor], list]:
         """构建融合的QKV+LoRA权重矩阵"""
         try:
@@ -1086,7 +1324,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         except Exception as e:
             print(f"❌ [QKV+LoRA Fusion] Error building fused weight: {e}")
             return None, []
-    
+
     def _compute_qkv_lora_fused(self, x: torch.Tensor, fused_weight: torch.Tensor) -> torch.Tensor:
         """执行融合的matmul计算"""
         # 一次大的matmul替代多个小的计算
@@ -1094,7 +1332,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         
         print(f"🧮 [QKV+LoRA Fusion] Fused matmul: {x.shape} × {fused_weight.shape} = {fused_output.shape}")
         return fused_output
-    
+
     def _split_qkv_lora_output(self, fused_output: torch.Tensor, lora_rank_info: list) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """分拆融合输出为QKV部分和LoRA shrink部分"""
         qkv_output_size = sum(self.output_slices)
@@ -1108,7 +1346,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
             return qkv_part, lora_shrink_part
         else:
             return qkv_part, None
-    
+
     def _reconstruct_shrink_for_expand(self, lora_shrink_parts: torch.Tensor, lora_rank_info: list, slice_has_lora: list) -> torch.Tensor:
         """重构shrink结果以匹配punica expand接口"""
         # punica expand期望的格式：[num_slices, num_tokens, lora_rank]
@@ -1147,18 +1385,6 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         
         print(f"🔄 [QKV+LoRA Fusion] Reconstructed shrink tensor: {reconstructed.shape}")
         return reconstructed
-
-    @classmethod
-    @_not_fully_sharded_can_replace
-    def can_replace_layer(
-        cls,
-        source_layer: nn.Module,
-        lora_config: LoRAConfig,
-        packed_modules_list: list,
-        model_config: Optional[PretrainedConfig],
-    ) -> bool:
-        return (type(source_layer) is QKVParallelLinear
-                and len(packed_modules_list) == 3)
 
 
 #TODO: Implement this

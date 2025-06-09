@@ -24,7 +24,7 @@ def main():
     llm = LLM(
         model=base_model_path,
         enable_lora=True,
-        max_lora_rank=64,  # Match LoRA model rank
+        max_lora_rank=128,  # Match LoRA model rank
         max_loras=1,
         max_model_len=256,  # Very small context
         tensor_parallel_size=1,

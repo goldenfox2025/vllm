@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Optional, Union, final
 
 import torch
 import sys
+import os
 
 import vllm.envs as envs
 from vllm.lora.layers import LoRAMapping
@@ -175,40 +176,54 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         x = x.view(-1, x.shape[-1])
 
-        # 添加详细的调试信息
-        print(f"\n🔍 LoRA Shrink 调试信息:")
-        print(f"   输入 x 形状: {x.shape}")
-        print(f"   输出 y 形状: {y.shape}")
-        print(f"   LoRA A 权重数量: {len(lora_a_stacked)}")
-        print(f"   缩放因子: {scale}")
+        # # 添加详细的调试信息
+        # print(f"\n🔍 LoRA Shrink 调试信息:")
+        # print(f"   输入 x 形状: {x.shape}")
+        # print(f"   输出 y 形状: {y.shape}")
+        # print(f"   LoRA A 权重数量: {len(lora_a_stacked)}")
+        # print(f"   缩放因子: {scale}")
 
-        for i, lora_a in enumerate(lora_a_stacked):
-            print(f"   LoRA A[{i}] 形状: {lora_a.shape}")
-            print(f"   LoRA A[{i}] 数据类型: {lora_a.dtype}")
-            print(f"   LoRA A[{i}] 设备: {lora_a.device}")
-            print(f"   LoRA A[{i}] 数值范围: [{torch.min(lora_a).item():.6f}, {torch.max(lora_a).item():.6f}]")
+        # for i, lora_a in enumerate(lora_a_stacked):
+        #     print(f"   LoRA A[{i}] 形状: {lora_a.shape}")
+        #     print(f"   LoRA A[{i}] 数据类型: {lora_a.dtype}")
+        #     print(f"   LoRA A[{i}] 设备: {lora_a.device}")
+        #     print(f"   LoRA A[{i}] 数值范围: [{torch.min(lora_a).item():.6f}, {torch.max(lora_a).item():.6f}]")
 
-        # 检查是否有 LoRA 映射信息
-        if hasattr(self, '_token_lora_indices') and self._token_lora_indices is not None:
-            print(f"   Token LoRA 索引形状: {self._token_lora_indices.shape}")
-            print(f"   Token LoRA 索引内容: {self._token_lora_indices[:min(10, len(self._token_lora_indices))].tolist()}")
-        else:
-            print(f"   ⚠️  Token LoRA 索引未设置")
+        # # 检查是否有 LoRA 映射信息
+        # if hasattr(self, '_token_lora_indices') and self._token_lora_indices is not None:
+        #     print(f"   Token LoRA 索引形状: {self._token_lora_indices.shape}")
+        #     print(f"   Token LoRA 索引内容: {self._token_lora_indices[:min(10, len(self._token_lora_indices))].tolist()}")
+        # else:
+        #     print(f"   ⚠️  Token LoRA 索引未设置")
 
-        # 检查元数据
-        if hasattr(self, 'token_mapping_meta'):
-            meta_args = self.token_mapping_meta.meta_args(x.size(0))
-            print(f"   元数据参数数量: {len(meta_args)}")
-            for i, arg in enumerate(meta_args):
-                if torch.is_tensor(arg):
-                    print(f"   元数据[{i}] 形状: {arg.shape}, 内容: {arg[:min(5, len(arg))].tolist()}")
-                else:
-                    print(f"   元数据[{i}]: {arg}")
-        else:
-            print(f"   ⚠️  Token mapping meta 未设置")
+        # # 检查元数据
+        # if hasattr(self, 'token_mapping_meta'):
+        #     meta_args = self.token_mapping_meta.meta_args(x.size(0))
+        #     print(f"   元数据参数数量: {len(meta_args)}")
+        #     for i, arg in enumerate(meta_args):
+        #         if torch.is_tensor(arg):
+        #             print(f"   元数据[{i}] 形状: {arg.shape}, 内容: {arg[:min(5, len(arg))].tolist()}")
+        #         else:
+        #             print(f"   元数据[{i}]: {arg}")
+        # else:
+        #     print(f"   ⚠️  Token mapping meta 未设置")
 
         # 如果 CUDA 和 Triton 都可用，则先调用 Triton，再调用 CUDA，对比结果
         if CUDA_LORA_AVAILABLE and HAS_TRITON:
+            import os
+            force_triton = os.environ.get("VLLM_FORCE_TRITON_LORA", "0") == "1"
+            
+            if force_triton:
+                print("🔵 强制使用 Triton LoRA shrink (VLLM_FORCE_TRITON_LORA=1)")
+                lora_shrink(
+                    x,
+                    lora_a_stacked,
+                    y,
+                    *self.token_mapping_meta.meta_args(x.size(0)),
+                    scale,
+                )
+                return
+            
             # 1. 先调用 Triton 实现
             y_triton = y.clone()  # 保存 Triton 结果
 
@@ -465,6 +480,22 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
      
         if CUDA_LORA_AVAILABLE and HAS_TRITON :
+            # 检查是否强制使用Triton
+            force_triton = os.environ.get("VLLM_FORCE_TRITON_LORA", "0") == "1"
+            
+            if force_triton:
+                print("🔵 强制使用 Triton LoRA expand (VLLM_FORCE_TRITON_LORA=1)")
+                lora_expand(
+                    x,
+                    lora_b_stacked,
+                    y,
+                    *self.token_mapping_meta.meta_args(num_tokens),
+                    offset_start=offset_start,
+                    add_inputs=True,
+                )
+                y = y.view_as(y_org)
+                return
+            
             # 1. 先调用 Triton 实现
             y_triton = y.clone()  # 保存 Triton 结果
             lora_expand(
