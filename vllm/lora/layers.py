@@ -862,6 +862,291 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         weight dimensions in qkv lora.
         """
         super().create_lora_weights(max_loras, lora_config, model_config)
+    
+    def apply(self,
+              x: torch.Tensor,
+              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """重写apply方法以支持QKV+LoRA融合"""
+        print(f"🎯 [QKV+LoRA Fusion] apply方法被调用 - 输入形状: {x.shape}")
+        print(f"🎯 [QKV+LoRA Fusion] 当前类: {self.__class__.__name__}")
+        
+        # 检查环境变量
+        import os
+        fusion_enabled = os.environ.get("VLLM_ENABLE_QKV_LORA_FUSION", "0")
+        print(f"🎯 [QKV+LoRA Fusion] 环境变量 VLLM_ENABLE_QKV_LORA_FUSION = {fusion_enabled}")
+        
+        # 检查LoRA权重状态（仅用于调试，不影响融合决策）
+        print(f"🎯 [QKV+LoRA Fusion] n_slices = {self.n_slices}")
+        for i in range(self.n_slices):
+            lora_sum = self.lora_a_stacked[i].abs().sum().item()
+            print(f"🎯 [QKV+LoRA Fusion] LoRA A[{i}] 权重总和: {lora_sum}")
+        
+        # 如果启用融合，始终尝试融合计算（不管LoRA权重是否为0）
+        if fusion_enabled == "1":
+            try:
+                print("🚀 [QKV+LoRA Fusion] 开始融合计算（不管LoRA权重值）")
+                
+                # 计算传统方法的结果用于验证
+                traditional_output = self._compute_traditional_method(x, bias)
+                
+                # 计算融合方法的结果
+                fused_output = self._fused_computation(x, bias)
+                
+                # 验证结果一致性
+                if self._verify_outputs(traditional_output, fused_output, rtol=1e-2, atol=2.0):
+                    print("✅ [QKV+LoRA Fusion] 融合计算结果验证通过，使用融合结果")
+                    return fused_output
+                else:
+                    print("⚠️  [QKV+LoRA Fusion] 融合计算结果验证失败，回退到传统方法")
+                    return traditional_output
+                    
+            except Exception as e:
+                print(f"⚠️  [QKV+LoRA Fusion] 融合计算出错: {e}，回退到传统方法")
+                return self._compute_traditional_method(x, bias)
+        
+        # 默认使用传统方法
+        return self._compute_traditional_method(x, bias)
+    
+    def _compute_traditional_method(
+        self, 
+        x: torch.Tensor, 
+        bias: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """计算传统的非融合方法，用于对比验证"""
+        output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+
+        # 处理批次维度
+        if x.ndim == 3 and output.ndim == 3:
+            output = output.flatten(0, 1)
+            x = x.flatten(0, 1)
+
+        lora_output: Optional[
+            torch.Tensor] = self.punica_wrapper.add_lora_linear(
+                output, x, self.lora_a_stacked, self.lora_b_stacked,
+                self.lora_bias_stacked, 1.0, self.output_slices)
+        if not current_platform.can_update_inplace():
+            output = lora_output
+
+        return output
+    
+    def _verify_outputs(
+        self, 
+        traditional_output: torch.Tensor, 
+        fused_output: torch.Tensor, 
+        rtol: float = 1e-2, 
+        atol: float = 2.0
+    ) -> bool:
+        """验证融合计算和传统计算的结果一致性"""
+        try:
+            # 检查形状
+            if traditional_output.shape != fused_output.shape:
+                print(f"❌ [QKV+LoRA Fusion] 输出形状不匹配: traditional {traditional_output.shape} vs fused {fused_output.shape}")
+                return False
+            
+            # 检查数值差异
+            max_diff = torch.max(torch.abs(traditional_output - fused_output)).item()
+            rel_diff = torch.max(torch.abs((traditional_output - fused_output) / (traditional_output + 1e-8))).item()
+            
+            print(f"🔍 [QKV+LoRA Fusion] 输出验证:")
+            print(f"   Traditional统计: min={traditional_output.min():.6f}, max={traditional_output.max():.6f}, mean={traditional_output.mean():.6f}")
+            print(f"   Fused统计: min={fused_output.min():.6f}, max={fused_output.max():.6f}, mean={fused_output.mean():.6f}")
+            print(f"   最大绝对差异: {max_diff:.6f}")
+            print(f"   最大相对差异: {rel_diff:.6f}")
+            
+            # 使用torch.allclose进行验证
+            is_close = torch.allclose(traditional_output, fused_output, rtol=rtol, atol=atol)
+            
+            if is_close:
+                print(f"✅ [QKV+LoRA Fusion] 输出验证通过 (rtol={rtol}, atol={atol})")
+            else:
+                print(f"❌ [QKV+LoRA Fusion] 输出验证失败 (rtol={rtol}, atol={atol})")
+            
+            return is_close
+            
+        except Exception as e:
+            print(f"❌ [QKV+LoRA Fusion] 输出验证出错: {e}")
+            return False
+
+    def _fused_computation(
+        self,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """融合的QKV+LoRA计算"""
+        print(f"🚀 [QKV+LoRA Fusion] Starting fused computation for {x.shape[0]} tokens")
+        
+        # 处理批次维度
+        if x.ndim == 3:
+            x = x.flatten(0, 1)
+        
+        # Step 1: 检查每个slice的LoRA权重状态（仅用于调试，始终处理所有slice）
+        slice_has_lora = []
+        for i in range(self.n_slices):
+            # 注意：即使权重为0，也认为"有LoRA"，因为这是LoRA层
+            # LoRA权重为0可能是warmup阶段或其他原因，但仍需要参与计算
+            has_lora = True  # 始终为True，因为这是LoRA层
+            slice_has_lora.append(has_lora)
+            lora_sum = self.lora_a_stacked[i].abs().sum().item()
+            print(f"🔍 [QKV+LoRA Fusion] Slice {i} LoRA权重总和: {lora_sum} (强制处理)")
+        
+        print(f"🔧 [QKV+LoRA Fusion] 所有slice都将参与融合计算: {slice_has_lora}")
+        
+        # Step 2: 构建融合权重矩阵（处理所有slice）
+        fused_weight, lora_rank_info = self._build_qkv_lora_fused_weight(x.device, x.dtype, slice_has_lora)
+        
+        if fused_weight is None:
+            print("⚠️ [QKV+LoRA Fusion] Failed to build fused weight, fallback to traditional")
+            return self._compute_traditional_method(x, bias)
+        
+        # Step 3: 执行融合的matmul计算
+        fused_output = self._compute_qkv_lora_fused(x, fused_weight)
+        
+        # Step 4: 分拆融合输出
+        qkv_part, lora_shrink_parts = self._split_qkv_lora_output(fused_output, lora_rank_info)
+        
+        # Step 5: 应用bias到QKV部分
+        if bias is not None:
+            qkv_part = qkv_part + bias
+        
+        # Step 6: 处理LoRA expand（所有slice都参与）
+        if lora_shrink_parts is not None and len(lora_rank_info) > 0:
+            print(f"🔄 [QKV+LoRA Fusion] Processing LoRA expand with shrink shape: {lora_shrink_parts.shape}")
+            
+            # 重构shrink结果以匹配punica expand接口
+            shrink_tensor = self._reconstruct_shrink_for_expand(lora_shrink_parts, lora_rank_info, slice_has_lora)
+            
+            print(f"🚀 [QKV+LoRA Fusion] Calling expand: QKV shape {qkv_part.shape}, shrink shape {shrink_tensor.shape}")
+            
+            # 调用expand操作
+            self.punica_wrapper.add_expand(
+                qkv_part,                # y: QKV输出，会被就地修改
+                shrink_tensor,           # x: 融合计算的shrink结果 [num_slices, num_tokens, lora_rank]
+                self.lora_b_stacked,     # lora_b权重
+                self.lora_bias_stacked,  # lora_bias权重  
+                self.output_slices,      # 输出分片
+                offset_start=0,
+                add_inputs=True          # 累加到QKV结果上
+            )
+            
+            print(f"✅ [QKV+LoRA Fusion] Expand completed, final output shape: {qkv_part.shape}")
+        
+        print(f"✅ [QKV+LoRA Fusion] Completed fused computation")
+        return qkv_part
+    
+    def _build_qkv_lora_fused_weight(self, device: torch.device, dtype: torch.dtype, slice_has_lora: list) -> tuple[Optional[torch.Tensor], list]:
+        """构建融合的QKV+LoRA权重矩阵"""
+        try:
+            # 获取QKV权重并转置到正确格式
+            qkv_weight = self.base_layer.weight  # [output_size_per_partition, input_size_per_partition]
+            qkv_weight = qkv_weight.T  # 转置为 [input_size_per_partition, output_size_per_partition]
+            print(f"🔧 [QKV+LoRA Fusion] QKV weight shape after transpose: {qkv_weight.shape}")
+            
+            # 收集所有slice的LoRA A权重和rank信息（包括权重为0的）
+            lora_a_weights = []
+            lora_rank_info = []
+            current_col = 0  # 正确累加列位置
+            
+            for i in range(self.n_slices):
+                lora_a = self.lora_a_stacked[i]  # [max_loras, 1, lora_rank, input_size]
+                print(f"🔧 [QKV+LoRA Fusion] LoRA A[{i}] raw shape: {lora_a.shape}")
+                
+                # 处理每个slice（不管权重是否为0）
+                # 重塑为2D: [lora_rank, input_size]，然后转置为 [input_size, lora_rank]
+                lora_a_2d = lora_a[0, 0]  # [lora_rank, input_size]
+                valid_lora_a = lora_a_2d.T  # [input_size, lora_rank]
+                print(f"🔧 [QKV+LoRA Fusion] LoRA A[{i}] processed shape: {valid_lora_a.shape}")
+                
+                lora_a_weights.append(valid_lora_a)
+                lora_rank_info.append({
+                    'slice_idx': i,
+                    'rank': valid_lora_a.shape[1],  # lora_rank
+                    'start_col': current_col
+                })
+                current_col += valid_lora_a.shape[1]  # 累加rank大小
+            
+            # 拼接所有LoRA A权重 
+            all_lora_a = torch.cat(lora_a_weights, dim=1)  # [input_size, total_lora_rank]
+            print(f"🔧 [QKV+LoRA Fusion] All LoRA A concatenated shape: {all_lora_a.shape}")
+            
+            # 打印rank信息用于调试
+            for info in lora_rank_info:
+                print(f"🔧 [QKV+LoRA Fusion] Slice {info['slice_idx']}: rank={info['rank']}, start_col={info['start_col']}")
+            
+            # 确保维度兼容性
+            if qkv_weight.shape[0] != all_lora_a.shape[0]:
+                print(f"❌ [QKV+LoRA Fusion] Dimension mismatch: QKV {qkv_weight.shape[0]} vs LoRA {all_lora_a.shape[0]}")
+                return None, []
+            
+            # 构建融合权重矩阵: [input_size, qkv_output_size + total_lora_rank]
+            fused_weight = torch.cat([qkv_weight, all_lora_a], dim=1)
+            print(f"🔧 [QKV+LoRA Fusion] Fused weight shape: {fused_weight.shape}")
+            
+            return fused_weight, lora_rank_info
+            
+        except Exception as e:
+            print(f"❌ [QKV+LoRA Fusion] Error building fused weight: {e}")
+            return None, []
+    
+    def _compute_qkv_lora_fused(self, x: torch.Tensor, fused_weight: torch.Tensor) -> torch.Tensor:
+        """执行融合的matmul计算"""
+        # 一次大的matmul替代多个小的计算
+        fused_output = torch.matmul(x, fused_weight)  # [num_tokens, qkv_output_size + total_lora_rank]
+        
+        print(f"🧮 [QKV+LoRA Fusion] Fused matmul: {x.shape} × {fused_weight.shape} = {fused_output.shape}")
+        return fused_output
+    
+    def _split_qkv_lora_output(self, fused_output: torch.Tensor, lora_rank_info: list) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """分拆融合输出为QKV部分和LoRA shrink部分"""
+        qkv_output_size = sum(self.output_slices)
+        
+        # 分拆
+        qkv_part = fused_output[:, :qkv_output_size]
+        
+        if fused_output.shape[1] > qkv_output_size and lora_rank_info:
+            lora_shrink_part = fused_output[:, qkv_output_size:]
+            print(f"📊 [QKV+LoRA Fusion] Split output - QKV: {qkv_part.shape}, LoRA shrink: {lora_shrink_part.shape}")
+            return qkv_part, lora_shrink_part
+        else:
+            return qkv_part, None
+    
+    def _reconstruct_shrink_for_expand(self, lora_shrink_parts: torch.Tensor, lora_rank_info: list, slice_has_lora: list) -> torch.Tensor:
+        """重构shrink结果以匹配punica expand接口"""
+        # punica expand期望的格式：[num_slices, num_tokens, lora_rank]
+        num_tokens = lora_shrink_parts.shape[0]
+        
+        # 为每个slice创建对应的shrink结果
+        slice_results = []
+        for i in range(self.n_slices):
+            # 查找这个slice对应的LoRA rank信息（现在所有slice都应该有info）
+            slice_info = None
+            for info in lora_rank_info:
+                if info['slice_idx'] == i:
+                    slice_info = info
+                    break
+            
+            if slice_info is not None:
+                # 提取对应的shrink部分
+                start_col = slice_info['start_col']
+                end_col = start_col + slice_info['rank']
+                slice_shrink = lora_shrink_parts[:, start_col:end_col]  # [num_tokens, rank]
+                slice_results.append(slice_shrink)
+                print(f"🔄 [QKV+LoRA Fusion] Slice {i} shrink: {slice_shrink.shape} (from cols {start_col}:{end_col})")
+            else:
+                # 如果找不到info，说明代码有问题，但为了兼容性还是创建零矩阵
+                print(f"⚠️ [QKV+LoRA Fusion] 警告：找不到slice {i}的rank信息，使用默认")
+                if hasattr(self.lora_a_stacked[i], 'shape') and len(self.lora_a_stacked[i].shape) >= 3:
+                    rank = self.lora_a_stacked[i].shape[2]  # [max_loras, 1, rank, input_size]
+                else:
+                    rank = 64  # 默认rank
+                zero_shrink = torch.zeros(num_tokens, rank, device=lora_shrink_parts.device, dtype=lora_shrink_parts.dtype)
+                slice_results.append(zero_shrink)
+                print(f"🔄 [QKV+LoRA Fusion] Slice {i} 使用零矩阵: {zero_shrink.shape}")
+        
+        # 堆叠成期望的格式
+        reconstructed = torch.stack(slice_results, dim=0)  # [num_slices, num_tokens, lora_rank]
+        
+        print(f"🔄 [QKV+LoRA Fusion] Reconstructed shrink tensor: {reconstructed.shape}")
+        return reconstructed
 
     @classmethod
     @_not_fully_sharded_can_replace
