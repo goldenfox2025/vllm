@@ -441,7 +441,6 @@ class MergedQKVParallelLinearWithShardedLoRA(MergedQKVParallelLinearWithLoRA):
         enable_fusion = os.environ.get("VLLM_ENABLE_QKV_LORA_FUSION", "0") == "1"
         
         if enable_fusion:
-            # 记录融合使用情况
             if not hasattr(self, '_fusion_logged'):
                 print(f"🚀 [QKV+LoRA Fusion] Enabled for {self.__class__.__name__}")
                 self._fusion_logged = True

@@ -1,5 +1,3 @@
-
-
 import ctypes
 import os
 import torch
@@ -218,9 +216,31 @@ def cuda_lora_shrink_triton_interface(
         num_tokens_per_lora_ptr = num_tokens_per_lora.data_ptr()
         lora_token_start_loc_ptr = lora_token_start_loc.data_ptr()
 
-
         active_lora_count = sum(1 for lora_id in lora_ids.tolist())
         max_active_loras = active_lora_count
+        
+        # 添加详细的调试信息
+        print(f"\n🟢 [CUDA Shrink Debug] 关键参数检查:")
+        print(f"   输入: {inputs.shape}, 隐藏大小: {hidden_size}")
+        print(f"   输出: {output_tensor.shape}, rank: {lora_rank}, slices: {num_slices}")
+        print(f"   LoRA IDs: {lora_ids.tolist()}")
+        print(f"   每个LoRA的token数: {num_tokens_per_lora.tolist()}")
+        print(f"   LoRA token起始位置: {lora_token_start_loc.tolist()}")
+        print(f"   token索引排序: {token_indices_sorted_by_lora_ids.tolist()}")
+        print(f"   最大活跃LoRA数: {max_active_loras}")
+        
+        # 检查映射合理性
+        total_mapped_tokens = sum(num_tokens_per_lora.tolist())
+        print(f"   映射检查: 总token={num_tokens}, 映射token={total_mapped_tokens}")
+        
+        if total_mapped_tokens != num_tokens:
+            print(f"   ⚠️  警告: token映射不完整! 总token={num_tokens}, 映射token={total_mapped_tokens}")
+        
+        # 检查LoRA权重形状
+        for i, lora_3d in enumerate(lora_a_weights):
+            print(f"   LoRA权重[{i}] 形状: {lora_3d.shape}")
+            if lora_3d.shape[0] != len(lora_ids) or lora_3d.shape[1] != lora_rank or lora_3d.shape[2] != hidden_size:
+                print(f"   ⚠️  警告: LoRA权重[{i}]形状不匹配! 期望: [{len(lora_ids)}, {lora_rank}, {hidden_size}]")
         
         # Call the C function with multi-LoRA support
         result = cuda_c_lib.cuda_lora_shrink_c(

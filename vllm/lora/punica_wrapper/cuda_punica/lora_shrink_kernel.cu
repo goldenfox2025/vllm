@@ -356,7 +356,7 @@ __global__ void lora_shrink_kernel_v1(
 
     for (int m = 0; m < TM; ++m) {
       for (int n = 0; n < TN; ++n) {
-        if ((tid_m + m < BLOCK_M) && (tid_n + n < BLOCK_N)) {
+        if ((tid_m + m) < BLOCK_M && (tid_n + n) < BLOCK_N) {
           for (int k = 0; k < BLOCK_K; ++k) {
             accumulator[m][n] +=
                 smem_input[tid_m + m][k] * smem_lora[tid_n + n][k];
@@ -685,6 +685,7 @@ void launch_lora_shrink_kernel(
   int N = lora_rank;                  // lora_rank
   int K = hidden_size;                // hidden_size
 
+ 
   if (input_dtype == 0 && output_dtype == 2) {  // half -> float
     lora_shrink_kernel_impl_v2<half, float>(
         static_cast<const half*>(input_ptr), lora_a_ptr_array,

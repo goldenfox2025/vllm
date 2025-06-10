@@ -82,6 +82,7 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CUDA_SOURCES
     lora_shrink_kernel.cu
     lora_expand_kernel.cu
+    lora_fused_expand_kernel.cu
 )
 set(C_SOURCES
     c_wrapper.cpp

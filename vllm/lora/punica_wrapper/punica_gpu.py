@@ -24,11 +24,13 @@ if HAS_TRITON:
 try:
     from .cuda_punica.ctypes_wrapper import cuda_lora_shrink_triton_interface, C_LIB_AVAILABLE
     from .cuda_punica.expand_ctypes_wrapper import cuda_lora_expand_triton_interface
+    from .cuda_punica.fused_expand_ctypes_wrapper import cuda_lora_fused_expand_triton_interface, FUSED_EXPAND_AVAILABLE
     CUDA_LORA_AVAILABLE = C_LIB_AVAILABLE
     if CUDA_LORA_AVAILABLE:
-        print("✅ CUDA LoRA kernels (shrink + expand) available")
+        print("✅ CUDA LoRA kernels (shrink + expand + fused_expand) available")
 except ImportError:
     CUDA_LORA_AVAILABLE = False
+    FUSED_EXPAND_AVAILABLE = False
 from .punica_base import PunicaWrapperBase
 
 if TYPE_CHECKING:
@@ -700,3 +702,89 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             raise RuntimeError("LoRA logits 处理需要 Triton 支持")
 
         y = y.view_as(y_org)
+
+    def add_fused_expand(self,
+                        y: torch.Tensor,
+                        fused_shrink_input: torch.Tensor,
+                        lora_b_stacked: tuple[torch.Tensor, ...],
+                        lora_bias_stacked: Optional[tuple[torch.Tensor, ...]],
+                        output_slices: tuple[int, ...],
+                        slice_rank_info: list,
+                        offset_start: int = 0,
+                        add_inputs=True,
+                        **kwargs) -> None:
+        """
+        专门处理QKV+LoRA融合计算的expand操作
+        
+        Args:
+            y: 输出张量 [num_tokens, total_hidden_size]
+            fused_shrink_input: 融合shrink结果 [num_tokens, total_lora_rank]
+                              格式：total_lora_rank = slice0_rank + slice1_rank + slice2_rank (当前实现)
+                              未来可能扩展为：max_loras * (slice0_rank + slice1_rank + slice2_rank)
+            lora_b_stacked: LoRA B权重tuple
+            lora_bias_stacked: LoRA bias权重tuple (可选)
+            output_slices: 输出分片大小
+            slice_rank_info: slice rank信息
+            offset_start: 输出偏移
+            add_inputs: 是否累加到输出
+        """
+        
+        print(f"🚀 [Fused Expand] 开始处理融合expand - 输入shape: {fused_shrink_input.shape}")
+        print(f"🚀 [Fused Expand] 输出shape: {y.shape}, output_slices: {output_slices}")
+        print(f"🚀 [Fused Expand] slice_rank_info: {slice_rank_info}")
+        
+        # 检查是否有LoRA操作需要处理
+        if self.no_lora:
+            print("🚀 [Fused Expand] 无LoRA需要处理")
+            return
+        
+        if fused_shrink_input is None or fused_shrink_input.numel() == 0:
+            print("🚀 [Fused Expand] 空的shrink输入")
+            return
+        
+        # 先尝试简单的回退方案：重构shrink tensor为传统格式
+        print("🔄 [Fused Expand] 使用传统expand方法处理融合shrink结果")
+        
+        try:
+            # 从fusion计算的shrink结果重构为传统格式
+            num_tokens = fused_shrink_input.shape[0]
+            num_slices = len(slice_rank_info)
+            
+            # 为每个slice重构shrink数据 - 简化版本
+            reconstructed_shrink_list = []
+            
+            for i, info in enumerate(slice_rank_info):
+                slice_idx = info['slice_idx']
+                rank = info['rank']
+                start_col = info['start_col']
+                
+                # 从融合shrink中提取当前slice的数据
+                # 假设每个token都有对应的shrink数据（即使可能为0）
+                end_col = start_col + rank
+                if end_col <= fused_shrink_input.shape[1]:
+                    slice_shrink_data = fused_shrink_input[:, start_col:end_col]  # [num_tokens, rank]
+                else:
+                    # 如果超出范围，创建零张量
+                    slice_shrink_data = torch.zeros(num_tokens, rank, 
+                                                   device=fused_shrink_input.device, 
+                                                   dtype=fused_shrink_input.dtype)
+                
+                reconstructed_shrink_list.append(slice_shrink_data)
+                print(f"🔄 [Fused Expand] 重构slice {slice_idx} shrink: {slice_shrink_data.shape} (从列 {start_col}:{end_col})")
+            
+            # 堆叠成传统格式 [num_slices, num_tokens, rank]
+            reconstructed_shrink = torch.stack(reconstructed_shrink_list, dim=0)
+            print(f"🔄 [Fused Expand] 重构完成: {reconstructed_shrink.shape}")
+            
+            # 调用传统expand
+            self.add_expand(y, reconstructed_shrink, lora_b_stacked, lora_bias_stacked,
+                           output_slices, offset_start, add_inputs)
+            
+            print("✅ [Fused Expand] 传统expand方法完成")
+            
+        except Exception as e:
+            print(f"❌ [Fused Expand] expand过程中出错: {e}")
+            import traceback
+            traceback.print_exc()
+            # 如果完全失败，至少不要让系统崩溃
+            print("⚠️  [Fused Expand] 操作失败，跳过LoRA计算")

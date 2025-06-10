@@ -5,7 +5,7 @@
 
 set -e  # Exit on any error
 
-echo "🛠️  Building CUDA LoRA kernel..."
+echo "🛠️  Building CUDA LoRA kernel (包括新的融合expand kernel)..."
 
 # Create build directory
 BUILD_DIR="build"
@@ -27,11 +27,12 @@ cmake .. \
   -Dpybind11_DIR="$PYBIND11_DIR" \
   -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90"
 
-echo "🔨 Compiling..."
+echo "🔨 Compiling (包括新的lora_fused_expand_kernel.cu)..."
 make -j$(nproc)
 
 echo "✅ Build completed successfully!"
 echo "📦 Extension module: $BUILD_DIR/cuda_punica*.so"
+echo "🚀 新增功能: LoRA融合expand kernel (专门处理QKV+LoRA融合计算)"
 
 # Copy the built module to parent directory for easy import
 # echo "📋 Copying module to parent directory..."
@@ -42,3 +43,8 @@ echo "🎉 CUDA LoRA kernel build complete!"
 # echo "To test the module:"
 # echo "  cd .."
 echo "  python3 -c 'import cuda_punica; print(\"✅ Module imported successfully!\")'"
+echo ""
+echo "新kernel功能:"
+echo "  - lora_fused_expand_kernel: 处理QKV+LoRA融合计算的expand操作"
+echo "  - 输入格式: [num_tokens, total_lora_rank]"
+echo "  - 输出格式: [num_tokens, total_hidden_size]"
