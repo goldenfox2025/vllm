@@ -26,7 +26,7 @@ int cuda_lora_shrink_c(
     void* stream_ptr, int input_dtype, int output_dtype) {
   try {
     cudaStream_t stream = 0;
-    cudaError_t err = cudaStreamSynchronize(stream);
+    cudaStreamSynchronize(stream);
 
     launch_lora_shrink_kernel(
         input_ptr, lora_a_ptr, output_ptr, token_indices_sorted_ptr,
@@ -71,7 +71,7 @@ int cuda_lora_expand_c(
     int output_stride1, void* stream_ptr, int input_dtype, int output_dtype) {
   // Use default CUDA stream (0) for simplicity
   cudaStream_t stream = 0;
-  cudaError_t err = cudaStreamSynchronize(stream);
+  cudaStreamSynchronize(stream);
   try {
     // Launch the clean expand kernel with new Triton-compatible interface
     launch_lora_expand_kernel(
@@ -104,59 +104,59 @@ int cuda_lora_expand_c(
 
 // LoRA Fused Expand C interface - 专门处理QKV+LoRA融合计算
 int cuda_lora_fused_expand_c(
-    void* fused_shrink_input_ptr,            // 融合shrink结果 [num_tokens, total_lora_rank]
-    void* lora_b_ptr_array,                  // LoRA B权重指针数组
-    void* output_ptr,                        // 输出 [num_tokens, total_hidden_size]
-    int* token_indices_sorted_ptr,           // 排序的token索引
-    int* lora_ids_ptr,                       // 活跃LoRA ID列表
-    int* num_tokens_per_lora_ptr,            // 每个LoRA的token数量
-    int* lora_token_start_loc_ptr,           // 每个LoRA的token起始位置
-    int* slice_starts_ptr,                   // 每个slice在输出中的起始位置
-    int* slice_ranks_ptr,                    // 每个slice的rank
-    int* slice_rank_starts_ptr,              // 每个slice在total_lora_rank中的起始位置
-    int* lora_strides_d0_ptr,                // LoRA B权重stride
-    int* lora_strides_d1_ptr,
-    int* lora_strides_d2_ptr,
-    int* hidden_sizes_ptr,                   // 每个slice的hidden_size
-    int max_active_loras,                    // 最大活跃LoRA数量
-    int num_total_tokens,                    // 总token数量
-    int total_hidden_size,                   // 总hidden_size
-    int num_slices,                          // slice数量
-    int add_inputs,                          // 是否累加输入 (0=false, 1=true)
-    int fused_input_stride0,                 // 融合输入的stride
+    void*
+        fused_shrink_input_ptr,  // 融合shrink结果 [num_tokens, total_lora_rank]
+    void* lora_b_ptr_array,      // LoRA B权重指针数组
+    void* output_ptr,            // 输出 [num_tokens, total_hidden_size]
+    int* token_indices_sorted_ptr,  // 排序的token索引
+    int* lora_ids_ptr,              // 活跃LoRA ID列表
+    int* num_tokens_per_lora_ptr,   // 每个LoRA的token数量
+    int* lora_token_start_loc_ptr,  // 每个LoRA的token起始位置
+    int* slice_starts_ptr,          // 每个slice在输出中的起始位置
+    int* slice_ranks_ptr,           // 每个slice的rank
+    int* slice_rank_starts_ptr,     // 每个slice在total_lora_rank中的起始位置
+    int* lora_strides_d0_ptr,       // LoRA B权重stride
+    int* lora_strides_d1_ptr, int* lora_strides_d2_ptr,
+    int* hidden_sizes_ptr,    // 每个slice的hidden_size
+    int max_active_loras,     // 最大活跃LoRA数量
+    int num_total_tokens,     // 总token数量
+    int total_hidden_size,    // 总hidden_size
+    int num_slices,           // slice数量
+    int add_inputs,           // 是否累加输入 (0=false, 1=true)
+    int fused_input_stride0,  // 融合输入的stride
     int fused_input_stride1,
-    int output_stride0,                      // 输出的stride
+    int output_stride0,  // 输出的stride
     int output_stride1,
-    void* stream_ptr,                        // CUDA流
-    int input_dtype,                         // 输入数据类型
-    int output_dtype                         // 输出数据类型
+    void* stream_ptr,  // CUDA流
+    int input_dtype,   // 输入数据类型
+    int output_dtype   // 输出数据类型
 ) {
-    cudaStream_t stream = 0;  // 使用默认流
-    
-    try {
-        launch_lora_fused_expand_kernel(
-            fused_shrink_input_ptr, lora_b_ptr_array, output_ptr,
-            token_indices_sorted_ptr, lora_ids_ptr, num_tokens_per_lora_ptr,
-            lora_token_start_loc_ptr, slice_starts_ptr, slice_ranks_ptr,
-            slice_rank_starts_ptr, lora_strides_d0_ptr, lora_strides_d1_ptr,
-            lora_strides_d2_ptr, hidden_sizes_ptr, max_active_loras,
-            num_total_tokens, total_hidden_size, num_slices, (bool)add_inputs,
-            fused_input_stride0, fused_input_stride1, output_stride0, output_stride1,
-            stream, input_dtype, output_dtype
-        );
+  cudaStream_t stream = 0;  // 使用默认流
 
-        // 同步检查错误
-        cudaError_t err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess) {
-            printf("CUDA fused expand kernel execution error: %s\n", cudaGetErrorString(err));
-            return 1;
-        }
+  try {
+    launch_lora_fused_expand_kernel(
+        fused_shrink_input_ptr, lora_b_ptr_array, output_ptr,
+        token_indices_sorted_ptr, lora_ids_ptr, num_tokens_per_lora_ptr,
+        lora_token_start_loc_ptr, slice_starts_ptr, slice_ranks_ptr,
+        slice_rank_starts_ptr, lora_strides_d0_ptr, lora_strides_d1_ptr,
+        lora_strides_d2_ptr, hidden_sizes_ptr, max_active_loras,
+        num_total_tokens, total_hidden_size, num_slices, (bool)add_inputs,
+        fused_input_stride0, fused_input_stride1, output_stride0,
+        output_stride1, stream, input_dtype, output_dtype);
 
-        return 0;  // 成功
-    } catch (...) {
-        printf("Exception in CUDA fused expand kernel\n");
-        return 1;  // 错误
+    // 同步检查错误
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+      printf("CUDA fused expand kernel execution error: %s\n",
+             cudaGetErrorString(err));
+      return 1;
     }
+
+    return 0;  // 成功
+  } catch (...) {
+    printf("Exception in CUDA fused expand kernel\n");
+    return 1;  // 错误
+  }
 }
 
 /**

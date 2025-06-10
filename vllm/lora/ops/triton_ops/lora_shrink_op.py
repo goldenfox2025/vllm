@@ -189,19 +189,19 @@ def _lora_shrink(
    
 
 
-    print(f"\n SHRINK KERNEL PARAMETERS:")
-    print(f"   M (num_tokens): {M}")
-    print(f"   N (lora_rank): {N}")
-    print(f"   K (hidden_size): {K}")
-    print(f"   NUM_SLICES: {NUM_SLICES}")
-    print(f"   MAX_LORAS: {MAX_LORAS}")
-    print(f"   BLOCK_M: {BLOCK_M}, BLOCK_N: {BLOCK_N}, BLOCK_K: {BLOCK_K}")
-    print(f"   SPLIT_K: {SPLIT_K}")
+    # print(f"\n SHRINK KERNEL PARAMETERS:")
+    # print(f"   M (num_tokens): {M}")
+    # print(f"   N (lora_rank): {N}")
+    # print(f"   K (hidden_size): {K}")
+    # print(f"   NUM_SLICES: {NUM_SLICES}")
+    # print(f"   MAX_LORAS: {MAX_LORAS}")
+    # print(f"   BLOCK_M: {BLOCK_M}, BLOCK_N: {BLOCK_N}, BLOCK_K: {BLOCK_K}")
+    # print(f"   SPLIT_K: {SPLIT_K}")
     
     # 计算grid
     grid_x = SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    print(f"   Grid calculation: {SPLIT_K} * {triton.cdiv(M, BLOCK_M)} * {triton.cdiv(N, BLOCK_N)} = {grid_x}")
-    print(f"   Final grid: ({grid_x}, {NUM_SLICES}, {MAX_LORAS})")
+    # print(f"   Grid calculation: {SPLIT_K} * {triton.cdiv(M, BLOCK_M)} * {triton.cdiv(N, BLOCK_N)} = {grid_x}")
+    # print(f"   Final grid: ({grid_x}, {NUM_SLICES}, {MAX_LORAS})")
     _lora_shrink._param_debug_printed = True
 
     grid = (

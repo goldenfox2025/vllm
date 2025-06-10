@@ -995,8 +995,10 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
                 x_flat = x.flatten(0, 1) if x.ndim == 3 else x
                 
                 # 1. QKV计算
+              
                 start_qkv.record()
-                qkv_output = self.base_layer.quant_method.apply(self.base_layer, x_flat, bias)
+                # qkv_output = self.base_layer.quant_method.apply(self.base_layer, x_flat, bias)
+                qkv_output = torch.nn.functional.linear(x_flat, self.base_layer.weight, bias)
                 end_qkv.record()
                 
                 # 2. LoRA shrink - 使用Triton kernel（绝对正确的基准）

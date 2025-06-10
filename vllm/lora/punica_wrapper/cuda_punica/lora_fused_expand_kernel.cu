@@ -50,8 +50,10 @@
  * @param output_d0_stride 输出张量第0维stride
  * @param output_d1_stride 输出张量第1维stride
  */
+
+
 template <typename InputT, typename OutputT>
-__global__ void lora_fused_expand_kernel(
+__global__ void lora_fused_expand_kernel_v0(
     const InputT* fused_shrink_input, const void* lora_b_ptr_array, OutputT* output,
     const int* token_indices_sorted, const int* lora_ids,
     const int* num_tokens_per_lora, const int* lora_token_start_loc,
@@ -186,7 +188,7 @@ __global__ void lora_fused_expand_kernel(
  * @brief LoRA Fused Expand Kernel 启动函数
  */
 template <typename InputT, typename OutputT>
-void lora_fused_expand_kernel_impl(
+void lora_fused_expand_kernel_impl_v0(
     const InputT* fused_shrink_input, const void* lora_b_ptr_array, OutputT* output,
     const int* token_indices_sorted, const int* lora_ids,
     const int* num_tokens_per_lora, const int* lora_token_start_loc,
@@ -214,7 +216,7 @@ void lora_fused_expand_kernel_impl(
   dim3 block(BLOCK_TOKENS, BLOCK_SLICE, BLOCK_HIDDEN);
 
   // 启动kernel
-  lora_fused_expand_kernel<InputT, OutputT><<<grid, block, 0, stream>>>(
+  lora_fused_expand_kernel_v0<InputT, OutputT><<<grid, block, 0, stream>>>(
       fused_shrink_input, lora_b_ptr_array, output,
       token_indices_sorted, lora_ids, num_tokens_per_lora, lora_token_start_loc,
       slice_starts, slice_ranks, lora_strides_d0, lora_strides_d1, lora_strides_d2, 
@@ -248,7 +250,7 @@ void launch_lora_fused_expand_kernel(
 
   // 根据数据类型分发
   if (input_dtype == 2 && output_dtype == 1) {  // float -> bf16
-    lora_fused_expand_kernel_impl<float, __nv_bfloat16>(
+    lora_fused_expand_kernel_impl_v0<float, __nv_bfloat16>(
         static_cast<const float*>(fused_shrink_input_ptr), lora_b_ptr_array,
         static_cast<__nv_bfloat16*>(output_ptr), token_indices_sorted_ptr,
         lora_ids_ptr, num_tokens_per_lora_ptr, lora_token_start_loc_ptr,
@@ -257,7 +259,7 @@ void launch_lora_fused_expand_kernel(
         hidden_sizes_ptr, max_active_loras, M, total_hidden_size, num_slices, add_inputs,
         fused_input_stride0, fused_input_stride1, output_stride0, output_stride1, stream);
   } else if (input_dtype == 0 && output_dtype == 0) {  // fp16 -> fp16
-    lora_fused_expand_kernel_impl<__half, __half>(
+    lora_fused_expand_kernel_impl_v0<__half, __half>(
         static_cast<const __half*>(fused_shrink_input_ptr), lora_b_ptr_array,
         static_cast<__half*>(output_ptr), token_indices_sorted_ptr,
         lora_ids_ptr, num_tokens_per_lora_ptr, lora_token_start_loc_ptr,
@@ -266,7 +268,7 @@ void launch_lora_fused_expand_kernel(
         hidden_sizes_ptr, max_active_loras, M, total_hidden_size, num_slices, add_inputs,
         fused_input_stride0, fused_input_stride1, output_stride0, output_stride1, stream);
   } else if (input_dtype == 1 && output_dtype == 1) {  // bf16 -> bf16
-    lora_fused_expand_kernel_impl<__nv_bfloat16, __nv_bfloat16>(
+    lora_fused_expand_kernel_impl_v0<__nv_bfloat16, __nv_bfloat16>(
         static_cast<const __nv_bfloat16*>(fused_shrink_input_ptr), lora_b_ptr_array,
         static_cast<__nv_bfloat16*>(output_ptr), token_indices_sorted_ptr,
         lora_ids_ptr, num_tokens_per_lora_ptr, lora_token_start_loc_ptr,

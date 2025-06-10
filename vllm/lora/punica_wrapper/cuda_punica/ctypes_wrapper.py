@@ -226,7 +226,11 @@ def cuda_lora_shrink_triton_interface(
         print(f"   LoRA IDs: {lora_ids.tolist()}")
         print(f"   每个LoRA的token数: {num_tokens_per_lora.tolist()}")
         print(f"   LoRA token起始位置: {lora_token_start_loc.tolist()}")
-        print(f"   token索引排序: {token_indices_sorted_by_lora_ids.tolist()}")
+        if(token_indices_sorted_by_lora_ids.shape[0] > 32):
+            print(f"   token索引排序: {token_indices_sorted_by_lora_ids.tolist()[:32]}")
+        else:
+            print(f"   token索引排序: {token_indices_sorted_by_lora_ids.tolist()}")
+
         print(f"   最大活跃LoRA数: {max_active_loras}")
         
         # 检查映射合理性
@@ -239,8 +243,6 @@ def cuda_lora_shrink_triton_interface(
         # 检查LoRA权重形状
         for i, lora_3d in enumerate(lora_a_weights):
             print(f"   LoRA权重[{i}] 形状: {lora_3d.shape}")
-            if lora_3d.shape[0] != len(lora_ids) or lora_3d.shape[1] != lora_rank or lora_3d.shape[2] != hidden_size:
-                print(f"   ⚠️  警告: LoRA权重[{i}]形状不匹配! 期望: [{len(lora_ids)}, {lora_rank}, {hidden_size}]")
         
         # Call the C function with multi-LoRA support
         result = cuda_c_lib.cuda_lora_shrink_c(

@@ -25,7 +25,7 @@ echo "🛠️  Running CMake..."
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -Dpybind11_DIR="$PYBIND11_DIR" \
-  -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90"
+  -DCMAKE_CUDA_ARCHITECTURES="89;90"
 
 echo "🔨 Compiling (包括新的lora_fused_expand_kernel.cu)..."
 make -j$(nproc)

@@ -10,6 +10,10 @@ import subprocess
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
+# 重要：禁用QKV+LoRA融合功能，避免新代码中的bug
+os.environ["VLLM_ENABLE_QKV_LORA_FUSION"] = "0"
+os.environ["VLLM_ENABLE_LORA_TIMING"] = "0"
+
 def main():
     # Model paths
     base_model_path = "hf_models/Qwen2.5-1.5B"
@@ -116,7 +120,7 @@ def main():
         lora2_request,  # LoRA 2
     ]
 
-    print(f"� Mixed batch configuration:")
+    print(f" Mixed batch configuration:")
     for i, (prompt, lora_req) in enumerate(zip(mixed_batch_prompts, mixed_batch_loras)):
         print(f"   [{i+1}] {lora_req.lora_name}: {prompt[:50]}...")
 

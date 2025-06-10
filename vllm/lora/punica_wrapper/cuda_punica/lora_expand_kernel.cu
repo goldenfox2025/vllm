@@ -216,6 +216,17 @@ __global__ void lora_expand_kernel(
   output[output_offset] = result;
 }
 
+template <typename... Args>
+bool is_contiguous(Args... args) {
+  int strides[] = {args...};
+  for (int i = 0; i < sizeof(strides) / sizeof(strides[0]) - 1; ++i) {
+    if (strides[i] < strides[i + 1]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * @brief LoRA Expand Kernel 实现函数 (LoRA扩展操作Kernel的模板实现与启动封装)
  *
