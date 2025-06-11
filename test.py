@@ -45,11 +45,11 @@ if __name__ == "__main__":
     print(f"--- JIT编译器: torch.compile 已启用, 数据类型: {dtype} ---\n")
 
     # 定义并编译计算函数
-    @torch.compile
+
     def compiled_linear(x, w, b):
         return F.linear(x, w, b)
 
-    @torch.compile
+
     def compiled_matmul(x, w_t):
         return torch.matmul(x, w_t)
 

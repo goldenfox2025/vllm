@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <iostream>
-#include <mma.h>  // 引入 WMMA 头文件
+#include <mma.h>    // 引入 WMMA 头文件
+#include <string>   // 用于std::string
+#include <cstdlib>  // 用于std::getenv
 
 template <typename InputT, typename OutputT, int BLOCK_M = 32, int BLOCK_N = 32,
           int BLOCK_K = 32>
@@ -700,6 +702,219 @@ void lora_shrink_kernel_impl_v2(
   }
 }
 
+template <typename InputT, typename OutputT, int BLOCK_M = 64, int BLOCK_N = 64,
+          int BLOCK_K = 32>
+__global__ void lora_shrink_kernel_v3(
+    const InputT* __restrict__ input,           // [num_tokens, hidden_size]
+    const void* __restrict__ lora_a_ptr_array,  // slice -> weight ptr
+    OutputT* __restrict__ output,  // [num_slices, num_tokens, lora_rank]
+    const int* __restrict__ token_indices_sorted,
+    const int* __restrict__ lora_ids,
+    const int* __restrict__ num_tokens_per_lora,
+    const int* __restrict__ lora_token_start_loc, int M, int N, int K,
+    int num_slices, float scaling,
+    // strides
+    int input_d0_stride, int input_d1_stride, int lora_d0_stride,
+    int lora_d1_stride, int lora_d2_stride, int output_d0_stride,
+    int output_d1_stride, int output_d2_stride) {
+  using namespace nvcuda;
+  // 确定当前线程块负责的mn维度的总块数
+  constexpr int padding = 8;
+  const int cta_n_num = (N + BLOCK_N - 1) / BLOCK_N;
+  const int cta_m_num = (M + BLOCK_M - 1) / BLOCK_M;
+  const int SPLIT_K = gridDim.x / (cta_m_num * cta_n_num);  // 运行时可变
+
+  const int pid_sk_m_n = blockIdx.x;
+  // 按照split k分解
+  const int pid_sk = pid_sk_m_n % SPLIT_K;
+  // 除以split k后， 按照m维度分解
+  const int cta_m_idx = (pid_sk_m_n / SPLIT_K) % cta_m_num;
+  // 除以split k和m维度后，按照n维度分解
+  const int cta_n_idx = pid_sk_m_n / (SPLIT_K * cta_m_num);
+
+  const int slice_id = blockIdx.y;
+  const int lora_idx = blockIdx.z;
+
+  const int lora_id = lora_ids[lora_idx];
+  if (lora_id < 0) return;  // 未启用 LoRA
+
+  /* 获取当前 slice 的 A 权重指针 */
+  const InputT* cur_lora_ptr = nullptr;
+  if (num_slices == 1) {
+    cur_lora_ptr = reinterpret_cast<const InputT*>(lora_a_ptr_array);
+  } else {
+    const int64_t* ptr_values =
+        reinterpret_cast<const int64_t*>(lora_a_ptr_array);
+    cur_lora_ptr = reinterpret_cast<const InputT*>(
+        static_cast<uintptr_t>(ptr_values[slice_id]));
+  }
+
+  // 得到当前lora需要处理的token长度
+  const int lora_m_size = num_tokens_per_lora[lora_idx];
+  // 当前线程块负责的token的起始位置
+  const int cta_m_offset = cta_m_idx * BLOCK_M;
+  const int cta_n_offset = cta_n_idx * BLOCK_N;
+
+  // 起始位置大于token长度，直接返回
+  if (cta_m_offset >= lora_m_size || cta_n_offset >= N) return;
+  const int lora_m_idx_start = lora_token_start_loc[lora_idx];
+
+  // 当前线程块负责的K维度
+  const int k_per_split = (K + SPLIT_K - 1) / SPLIT_K;
+  const int k_begin = pid_sk * k_per_split;
+  const int k_end = min(K, k_begin + k_per_split);
+
+  // 共享内存 (为WMMA优化，使用swizzle访问，无padding)
+  __shared__ InputT smem_input[BLOCK_M * (BLOCK_K + padding)];       // 行主序 (A)
+  __shared__ InputT smem_lora_a[BLOCK_N * (BLOCK_K + padding)];      // 列主序 (B)
+  __shared__ float smem_accumulator[BLOCK_M * BLOCK_N];  // 用于暂存WMMA结果
+
+  // 线程与Warp坐标，用于WMMA
+  const int warp_id = threadIdx.x >> 5;
+
+  // WMMA fragment 尺寸 (16x16x16)
+  constexpr int WM = 16, WN = 16, WK_FRAG = 16;
+  // Warp 在 CTA 内的二维布局
+  constexpr int WARPS_PER_ROW = BLOCK_N / WN;
+  constexpr int TOTAL_WARPS = (BLOCK_M / WM) * WARPS_PER_ROW;
+
+  // 当前 warp 在 CTA 内的二维坐标 (行, 列)
+  const int warp_row_idx = warp_id / WARPS_PER_ROW;
+  const int warp_col_idx = warp_id % WARPS_PER_ROW;
+
+  // 初始化WMMA累加器 fragment
+  wmma::fragment<wmma::accumulator, WM, WN, WK_FRAG, float> accumulator_frag;
+  wmma::fill_fragment(accumulator_frag, 0.0f);
+
+  // 主循环：遍历 K
+  for (int k_off = k_begin; k_off < k_end; k_off += BLOCK_K) {
+    // 载入input到共享内存 (行主序 + swizzle)
+    for (int idx = threadIdx.x; idx < BLOCK_M * BLOCK_K; idx += blockDim.x) {
+      const int lm = idx / BLOCK_K;
+      const int lk = idx % BLOCK_K;
+      InputT val = InputT(0);
+      const int gm = cta_m_offset + lm;
+      const int gk = k_off + lk;
+      if (gm < lora_m_size && gk < k_end) {
+        const int actual_token_idx =
+            token_indices_sorted[lora_m_idx_start + gm];
+        val = input[actual_token_idx * input_d0_stride + gk * input_d1_stride];
+      }
+      smem_input[lm * (BLOCK_K + padding) + lk] = val;
+    }
+
+    // 载入LoRA A到共享内存 (列主序 + swizzle)
+    for (int idx = threadIdx.x; idx < BLOCK_N * BLOCK_K; idx += blockDim.x) {
+      const int ln = idx / BLOCK_K;
+      const int lk = idx % BLOCK_K;
+      InputT val = InputT(0);
+      const int gn = cta_n_offset + ln;
+      const int gk = k_off + lk;
+      if (gn < N && gk < k_end)
+        val = cur_lora_ptr[lora_id * lora_d0_stride + gn * lora_d1_stride +
+                           gk * lora_d2_stride];
+      smem_lora_a[ln * (BLOCK_K + padding) + lk] = val;
+    }
+    __syncthreads();
+
+    // 片上 WMMA 计算
+    if (warp_id < TOTAL_WARPS) {
+#pragma unroll
+      for (int k_frag = 0; k_frag < BLOCK_K; k_frag += WK_FRAG) {
+        const InputT* ptr_a = smem_input + warp_row_idx * WM * (BLOCK_K + padding) + k_frag;
+        const InputT* ptr_b =
+            smem_lora_a + warp_col_idx * WN * (BLOCK_K + padding) + k_frag;
+
+        wmma::fragment<wmma::matrix_a, WM, WN, WK_FRAG, InputT, wmma::row_major>
+            a_frag;
+        wmma::fragment<wmma::matrix_b, WM, WN, WK_FRAG, InputT, wmma::col_major>
+            b_frag;
+
+        wmma::load_matrix_sync(a_frag, ptr_a, BLOCK_K + padding);
+        wmma::load_matrix_sync(b_frag, ptr_b, BLOCK_K + padding);
+        wmma::mma_sync(accumulator_frag, a_frag, b_frag, accumulator_frag);
+      }
+    }
+    __syncthreads();
+  }
+
+  // 将Warp的计算结果(fragment)写回到共享内存
+  if (warp_id < TOTAL_WARPS) {
+    wmma::store_matrix_sync(
+        smem_accumulator + warp_row_idx * WM * BLOCK_N + warp_col_idx * WN,
+        accumulator_frag, BLOCK_N, wmma::mem_row_major);
+  }
+  __syncthreads();
+
+  // 写回（带 Split-K 归并）
+  for (int idx = threadIdx.x; idx < BLOCK_M * BLOCK_N; idx += blockDim.x) {
+    const int lm = idx / BLOCK_N;
+    const int ln = idx % BLOCK_N;
+    const int tok_in_lora = cta_m_offset + lm;
+    const int rank_idx = cta_n_offset + ln;
+
+    if (tok_in_lora < lora_m_size && rank_idx < N) {
+      const int actual_tok =
+          token_indices_sorted[lora_m_idx_start + tok_in_lora];
+      const int out_off = slice_id * output_d0_stride +
+                          actual_tok * output_d1_stride +
+                          rank_idx * output_d2_stride;
+      const float val = smem_accumulator[lm * BLOCK_N + ln] * scaling;
+
+      // Split-K 归并
+      if (SPLIT_K == 1) {
+        output[out_off] = static_cast<OutputT>(val);
+      } else {
+        if constexpr (std::is_same_v<OutputT, float>) {
+          atomicAdd(&output[out_off], val);
+        } else if constexpr (std::is_same_v<OutputT, half>) {
+          atomicAdd(&output[out_off], __float2half(val));
+        } else if constexpr (std::is_same_v<OutputT, __nv_bfloat16>) {
+          atomicAdd(&output[out_off], __float2bfloat16(val));
+        }
+      }
+    }
+  }
+}
+
+template <typename InT, typename OutT, int BM = 32, int BN = 32, int BK = 16>
+void lora_shrink_kernel_impl_v3(
+    const InT* input, const void* lora_ptrs, OutT* output,
+    const int* tok_sorted, const int* lora_ids, const int* tok_cnt_per_lora,
+    const int* lora_tok_start, int max_active_loras, int M, int N, int K,
+    int num_slices, float scaling, int in_s0, int in_s1, int w_s0, int w_s1,
+    int w_s2, int out_s0, int out_s1, int out_s2, cudaStream_t stream) {
+  static_assert(std::is_same_v<InT, half> || std::is_same_v<InT, __nv_bfloat16>,
+                "v3 WMMA only supports half/bfloat16 input");
+  if (!is_contiguous(w_s0, w_s1, w_s2) ||
+      !is_contiguous(out_s0, out_s1, out_s2) || !is_contiguous(in_s0, in_s1)) {
+    throw std::runtime_error("strides must be contiguous");
+  }
+
+  int CTA_M = (M + BM - 1) / BM;
+  int CTA_N = (N + BN - 1) / BN;
+  int split_k = max(1, (K + BK - 1) / (BK * 4));
+  split_k = min(split_k, 32);
+
+  dim3 grid(split_k * CTA_M * CTA_N, num_slices, max_active_loras);
+  dim3 block(512);
+  // size_t shmem = (BM + BN) * BK * sizeof(InT) + BM * BN * sizeof(float);
+
+  if (split_k > 1) {
+    size_t bytes = static_cast<size_t>(num_slices) * M * N * sizeof(OutT);
+    cudaMemsetAsync(output, 0, bytes, stream);
+  }
+
+  lora_shrink_kernel_v3<InT, OutT, BM, BN, BK><<<grid, block, 0, stream>>>(
+      input, lora_ptrs, output, tok_sorted, lora_ids, tok_cnt_per_lora,
+      lora_tok_start, M, N, K, num_slices, scaling, in_s0, in_s1, w_s0, w_s1,
+      w_s2, out_s0, out_s1, out_s2);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf("launch error (lora-v3-wmma): %s\n", cudaGetErrorString(err));
+  }
+}
 
 void launch_lora_shrink_kernel(
     const void* input_ptr, const void* lora_a_ptr_array, void* output_ptr,
@@ -715,7 +930,7 @@ void launch_lora_shrink_kernel(
   int K = hidden_size;                // hidden_size
 
   if (input_dtype == 0 && output_dtype == 2) {  // half -> float
-    lora_shrink_kernel_impl_v2<half, float>(
+    lora_shrink_kernel_impl_v3<half, float>(
         static_cast<const half*>(input_ptr), lora_a_ptr_array,
         static_cast<float*>(output_ptr), token_indices_sorted_ptr, lora_ids_ptr,
         num_tokens_per_lora_ptr, lora_token_start_loc_ptr, max_active_loras, M,
@@ -724,7 +939,7 @@ void launch_lora_shrink_kernel(
         output_stride_0, output_stride_1, output_stride_2,  // output strides
         stream);
   } else if (input_dtype == 0 && output_dtype == 0) {  // half -> half
-    lora_shrink_kernel_impl_v2<half, half>(
+    lora_shrink_kernel_impl_v3<half, half>(
         static_cast<const half*>(input_ptr), lora_a_ptr_array,
         static_cast<half*>(output_ptr), token_indices_sorted_ptr, lora_ids_ptr,
         num_tokens_per_lora_ptr, lora_token_start_loc_ptr, max_active_loras, M,
@@ -733,7 +948,7 @@ void launch_lora_shrink_kernel(
         output_stride_0, output_stride_1, output_stride_2,  // output strides
         stream);
   } else if (input_dtype == 1 && output_dtype == 2) {  // bf16 -> float
-    lora_shrink_kernel_impl_v2<__nv_bfloat16, float>(
+    lora_shrink_kernel_impl_v3<__nv_bfloat16, float>(
         static_cast<const __nv_bfloat16*>(input_ptr), lora_a_ptr_array,
         static_cast<float*>(output_ptr), token_indices_sorted_ptr, lora_ids_ptr,
         num_tokens_per_lora_ptr, lora_token_start_loc_ptr, max_active_loras, M,

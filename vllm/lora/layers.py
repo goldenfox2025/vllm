@@ -950,10 +950,12 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         
         # 测量传统方法
         print("📊 [性能测量] 测量传统方法...")
+        print("x.shape:", x.shape)
         traditional_times = self._measure_traditional_method(x, bias, num_iterations=10)
         
         # 测量融合方法
         print("📊 [性能测量] 测量融合方法...")
+        print("x.shape:", x.shape)
         fused_times, fused_output = self._measure_fused_method(x, bias, num_iterations=10)
         
         # 输出详细的性能报告
@@ -998,9 +1000,12 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
               
                 start_qkv.record()
                 # qkv_output = self.base_layer.quant_method.apply(self.base_layer, x_flat, bias)
-                qkv_output = torch.nn.functional.linear(x_flat, self.base_layer.weight, bias)
+                # qkv_output = torch.nn.functional.linear(x_flat, self.base_layer.weight, bias)
+                qkv_output = torch.matmul(x_flat, self.base_layer.weight.T)
                 end_qkv.record()
                 
+                if bias is not None:
+                    qkv_output = qkv_output + bias  
                 # 2. LoRA shrink - 使用Triton kernel（绝对正确的基准）
                 start_shrink.record()
                 # 创建buffer用于shrink结果
@@ -1084,7 +1089,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
             
             # 处理批次维度
             x_flat = x.flatten(0, 1) if x.ndim == 3 else x
-            
+            print(f"x_flat.shape: {x_flat.shape}")
             # 1. 构建融合权重（现在计时！）
             start_build.record()
             slice_has_lora = [True] * self.n_slices
