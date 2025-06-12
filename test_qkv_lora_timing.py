@@ -41,6 +41,7 @@ def setup_performance_environment():
         "VLLM_ENABLE_QKV_LORA_FUSION": "1",  # 启用QKV+LoRA融合
         "VLLM_ENABLE_LORA_TIMING": "1",      # 启用详细时间测量
         "VLLM_USE_V1": "0",                  # 使用V0引擎
+        "VLLM_ENABLE_TIMING": "1"
     }
     
     for key, value in performance_env.items():

@@ -828,7 +828,9 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
     the same shape).
     """
 
-    def __init__(self, base_layer: QKVParallelLinear) -> None:
+    def __init__(
+        self, base_layer: Union[MergedColumnParallelLinear,
+                                QKVParallelLinear]) -> None:
         super().__init__(base_layer)
         # There are three LoRA layer.
         self.n_slices = len(self.base_layer.output_sizes)
@@ -857,6 +859,21 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         self.fused_qkv_lora_a_weight: Optional[torch.Tensor] = None
         # LoRA A权重的布局信息，用于fused_expand
         self.qkv_output_size = self.q_proj_shard_size + self.kv_proj_shard_size * 2
+        
+        # 计时相关变量
+        # 使用环境变量控制：VLLM_ENABLE_TIMING=0 禁用计时，VLLM_ENABLE_TIMING=1 启用计时（默认）
+        self.timing_enabled = os.environ.get("VLLM_ENABLE_TIMING", "1") == "1"
+        self.total_calls = 0
+        self.total_gemm_time = 0.0
+        self.total_split_time = 0.0
+        self.total_bias_time = 0.0
+        self.total_expand_time = 0.0
+        self.total_traditional_time = 0.0
+        self.total_overall_time = 0.0
+        # 传统方法的详细计时统计
+        self.total_traditional_qkv_time = 0.0
+        self.total_traditional_lora_time = 0.0
+        self.traditional_calls = 0
 
     def _build_fused_qkv_lora_a_weight(self):
         # Base QKV 部分
@@ -915,8 +932,22 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
     def _compute_traditional(self, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         """传统的QKV+LoRA计算方法，用于验证"""
-        print(self.base_layer.weight.shape)
+        # 传统方法的分阶段计时
+        if self.timing_enabled:
+            start_trad_qkv = torch.cuda.Event(enable_timing=True)
+            end_trad_qkv = torch.cuda.Event(enable_timing=True)
+            start_trad_lora = torch.cuda.Event(enable_timing=True)
+            end_trad_lora = torch.cuda.Event(enable_timing=True)
+            
+            # Stage 1: 基础QKV线性变换
+            start_trad_qkv.record()
+        
         qkv_output = F.linear(x, self.base_layer.weight, bias)
+        
+        if self.timing_enabled:
+            end_trad_qkv.record()
+            start_trad_lora.record()
+        
         if self.lora_a_stacked is not None and len(self.lora_a_stacked) > 0:
             x_flat = x.flatten(0, 1) if x.ndim == 3 else x
             qkv_output_flat = qkv_output.flatten(0, 1) if qkv_output.ndim == 3 else qkv_output
@@ -929,6 +960,32 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
                 1.0, # scale
                     self.output_slices,
             )
+        
+        if self.timing_enabled:
+            end_trad_lora.record()
+            torch.cuda.synchronize()
+            
+            # 计算传统方法各阶段耗时
+            trad_qkv_time = start_trad_qkv.elapsed_time(end_trad_qkv)
+            trad_lora_time = start_trad_lora.elapsed_time(end_trad_lora)
+            
+            # 更新累计统计
+            self.traditional_calls += 1
+            self.total_traditional_qkv_time += trad_qkv_time
+            self.total_traditional_lora_time += trad_lora_time
+            
+            # 打印传统方法的详细计时
+            print(f"\n📋 Traditional Method Detailed Timing:")
+            print(f"  Base QKV Linear:    {trad_qkv_time:.3f} ms")
+            print(f"  LoRA Computation:   {trad_lora_time:.3f} ms")
+            print(f"  Traditional Total:  {trad_qkv_time + trad_lora_time:.3f} ms")
+            
+            # 打印传统方法的累计平均耗时
+            print(f"\n📊 Traditional Method Cumulative Average (over {self.traditional_calls} calls):")
+            print(f"  Avg Base QKV Linear:  {self.total_traditional_qkv_time / self.traditional_calls:.3f} ms")
+            print(f"  Avg LoRA Computation: {self.total_traditional_lora_time / self.traditional_calls:.3f} ms")
+            print(f"  Avg Traditional Total: {(self.total_traditional_qkv_time + self.total_traditional_lora_time) / self.traditional_calls:.3f} ms")
+            
         return qkv_output
 
     def _compare_and_validate_outputs(self, 
@@ -946,10 +1003,10 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         max_diff = torch.max(diff).item()
         is_close = torch.allclose(fused_flat, traditional_flat, rtol=1e-1, atol=1e-1)
 
-        print("🔍 QKV+LoRA 融合结果验证")
-        print(f"Shape: {traditional_flat.shape}, Max diff: {max_diff:.2e}, 一致性: {'✅' if is_close else '❌'}")
-
+        # 只在验证失败时输出详细信息
         if not is_close:
+            print("🔍 QKV+LoRA 融合结果验证")
+            print(f"Shape: {traditional_flat.shape}, Max diff: {max_diff:.2e}, 一致性: {'✅' if is_close else '❌'}")
             # 展示前10个
             print(f"前10个传统输出: {traditional_flat[:10]}")
             print(f"前10个融合输出: {fused_flat[:10]}")
@@ -966,7 +1023,8 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
             raise RuntimeError(f"❌ 验证失败：最大差异 {max_diff:.2e} 超出容差")
 
-        print("✅ 验证通过：Traditional 与 Fused 输出一致")
+        # 验证通过时仅简单记录
+        # print("✅ 验证通过：Traditional 与 Fused 输出一致")
 
 
     def apply(self,
@@ -976,41 +1034,68 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         重写apply方法，使用"一次GEMM"的融合优化方案。
         核心修复：每次调用都重新构建融合权重，以解决权重陈旧问题。
         """
-        # 强制使用此融合路径进行测试
-        # if os.environ.get("VLLM_ENABLE_QKV_LORA_FUSION", "0") == "0":
-        #     return self._compute_traditional(x, bias)
-        
-        # 关键修复：移除 if self.fused_qkv_lora_a_weight is None 条件，
-        # 确保每次前向传播都重新构建最新的融合权重。
-        self._build_fused_qkv_lora_a_weight()
+        # 下面的代码意思是：如果环境变量VLLM_ENABLE_QKV_LORA_FUSION为0，则不使用融合优化，使用传统方法
+        if os.environ.get("VLLM_ENABLE_QKV_LORA_FUSION", "0") == "0":
+            return self._compute_traditional(x, bias)
+        # CUDA Events for timing
+        if self.timing_enabled:
+            start_overall = torch.cuda.Event(enable_timing=True)
+            end_overall = torch.cuda.Event(enable_timing=True)
+            start_gemm = torch.cuda.Event(enable_timing=True)
+            end_gemm = torch.cuda.Event(enable_timing=True)
+            start_split = torch.cuda.Event(enable_timing=True)
+            end_split = torch.cuda.Event(enable_timing=True)
+            start_bias = torch.cuda.Event(enable_timing=True)
+            end_bias = torch.cuda.Event(enable_timing=True)
+            start_expand = torch.cuda.Event(enable_timing=True)
+            end_expand = torch.cuda.Event(enable_timing=True)
+            start_traditional = torch.cuda.Event(enable_timing=True)
+            end_traditional = torch.cuda.Event(enable_timing=True)
             
+            start_overall.record()
+        
+        # 关键修复：确保每次前向传播都重新构建最新的融合权重（不计时）
+        self._build_fused_qkv_lora_a_weight()
+
         # 1. 准备输入
         x_flat = x.flatten(0, 1) if x.ndim == 3 else x
 
-        # 2. 执行一次大的GEMM，同时计算基础QKV和所有LoRA A的输出
-        # self.fused_qkv_lora_a_weight 的形状是 [hidden_size, qkv_size + total_lora_rank]
-        # x_flat 的形状是 [num_tokens, hidden_size]
-        # fused_output_matmul 的形状是 [num_tokens, qkv_size + total_lora_rank]
+        # Stage 1: 执行一次大的GEMM
+        if self.timing_enabled:
+            start_gemm.record()
+        
         fused_output_matmul = torch.matmul(x_flat, self.fused_qkv_lora_a_weight)
+        
+        if self.timing_enabled:
+            end_gemm.record()
 
-        # 3. 拆分GEMM的输出
-        # 基础QKV的输出
+        # Stage 2: 拆分GEMM的输出
+        if self.timing_enabled:
+            start_split.record()
+            
         qkv_output_fused = fused_output_matmul[:, :self.qkv_output_size].contiguous()
-        # 所有LoRA A与输入的乘积结果，作为LoRA B expand操作的输入
         lora_a_output = fused_output_matmul[:, self.qkv_output_size:].contiguous()
+        
+        if self.timing_enabled:
+            end_split.record()
 
-        # 如果有bias，加到QKV基础输出上
+        # Stage 3: 添加bias
+        if self.timing_enabled:
+            start_bias.record()
+            
         if bias is not None:
             qkv_output_fused = qkv_output_fused + bias
+            
+        if self.timing_enabled:
+            end_bias.record()
 
         # 4. 准备调用自定义的融合expand CUDA内核所需的元数据
         from vllm.lora.punica_wrapper.cuda_punica.fused_expand_ctypes_wrapper import cuda_fused_qkv_expand_interface
         
-        # 从punica_wrapper获取最新的token-to-lora映射信息
         num_tokens = x_flat.shape[0]
         meta_args = self.punica_wrapper.token_mapping_meta.meta_args(num_tokens)
         (
-            _,  # token_lora_mapping (unused)
+            _,
             token_indices_sorted,         
             num_tokens_per_lora,          
             lora_token_start_loc,         
@@ -1018,36 +1103,113 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
             no_lora_flag,                 
         ) = meta_args
 
-        # 5. 调用自定义的融合expand内核
-        # 这个内核会根据token_indices_sorted和lora_ids等元数据，
-        # 将lora_a_output中正确的部分与lora_b_stacked中的权重相乘，
-        # 并将结果加到qkv_output_fused上。
+        # Stage 4: 调用自定义的融合expand内核
+        if self.timing_enabled:
+            start_expand.record()
+            
         success = cuda_fused_qkv_expand_interface(
             fused_matmul_output=lora_a_output,
             output_tensor=qkv_output_fused,
             lora_b_stacked=self.lora_b_stacked,
             lora_bias_stacked=self.lora_bias_stacked,
             output_slices=self.output_slices,
-            # lora_a_slice_starts和lora_slice_ranks现在在_build_fused_qkv_lora_a_weight中设置
             lora_a_slice_starts=self.lora_a_slice_starts,
             lora_slice_ranks=self.lora_slice_ranks,
             token_indices_sorted=token_indices_sorted,
             num_tokens_per_lora=num_tokens_per_lora,
             lora_token_start_loc=lora_token_start_loc,
             lora_ids=lora_ids,
-            qkv_output_size=self.qkv_output_size, # 恢复传入qkv_output_size
+            qkv_output_size=self.qkv_output_size,
             no_lora_flag=no_lora_flag,
         )
         
+        
+        if self.timing_enabled:
+            end_expand.record()
+        
         if not success:
             raise RuntimeError("❌ Fused expand kernel failed")
+
+        # Stage 5: (可选) 验证正确性
+        verify_enabled = os.environ.get("VLLM_VERIFY_FUSED_LORA", "0") == "1"
+        if verify_enabled:
+            if self.timing_enabled:
+                start_traditional.record()
+                
+            qkv_output_traditional = self._compute_traditional(x, bias)
+            
+            if self.timing_enabled:
+                end_traditional.record()
+                
+            self._compare_and_validate_outputs(qkv_output_fused, qkv_output_traditional)
         
-        # 6. (可选) 验证正确性
-        # 计算传统方法结果并比较
-        # qkv_output_traditional = self._compute_traditional(x, bias)
-        # self._compare_and_validate_outputs(qkv_output_fused, qkv_output_traditional)
+        final_output = qkv_output_fused.view_as(x) if x.ndim == 3 else qkv_output_fused
         
-        return qkv_output_fused.view_as(x) if x.ndim == 3 else qkv_output_fused
+        if self.timing_enabled:
+            end_overall.record()
+            
+            # 等待所有CUDA操作完成
+            torch.cuda.synchronize()
+            
+            # 计算各阶段耗时
+            gemm_time = start_gemm.elapsed_time(end_gemm)
+            split_time = start_split.elapsed_time(end_split)
+            bias_time = start_bias.elapsed_time(end_bias)
+            expand_time = start_expand.elapsed_time(end_expand)
+            overall_time = start_overall.elapsed_time(end_overall)
+            traditional_time = 0.0
+            if verify_enabled:
+                traditional_time = start_traditional.elapsed_time(end_traditional)
+            
+            # 累计统计
+            self.total_calls += 1
+            self.total_gemm_time += gemm_time
+            self.total_split_time += split_time
+            self.total_bias_time += bias_time
+            self.total_expand_time += expand_time
+            self.total_traditional_time += traditional_time
+            self.total_overall_time += overall_time
+            
+            # 打印当前轮次的详细计时
+            print(f"\n=== 🚀 Fused QKV LoRA Timing Report (Call #{self.total_calls}) ===")
+            print(f"Stage 1 - Large GEMM:     {gemm_time:.3f} ms")
+            print(f"Stage 2 - Output Split:   {split_time:.3f} ms") 
+            print(f"Stage 3 - Add Bias:       {bias_time:.3f} ms")
+            print(f"Stage 4 - Fused Expand:   {expand_time:.3f} ms")
+            if verify_enabled:
+                print(f"Stage 5 - Traditional:    {traditional_time:.3f} ms")
+            print(f"Overall Time:             {overall_time:.3f} ms")
+            
+            # 打印累计平均耗时
+            print(f"\n📊 Cumulative Average Timing (over {self.total_calls} calls):")
+            print(f"Avg Large GEMM:     {self.total_gemm_time / self.total_calls:.3f} ms")
+            print(f"Avg Output Split:   {self.total_split_time / self.total_calls:.3f} ms")
+            print(f"Avg Add Bias:       {self.total_bias_time / self.total_calls:.3f} ms") 
+            print(f"Avg Fused Expand:   {self.total_expand_time / self.total_calls:.3f} ms")
+            if self.total_traditional_time > 0:
+                print(f"Avg Traditional:    {self.total_traditional_time / self.total_calls:.3f} ms")
+            print(f"Avg Overall:        {self.total_overall_time / self.total_calls:.3f} ms")
+            
+            # 如果有传统方法的详细统计，显示对比分析
+            if self.traditional_calls > 0:
+                avg_fused = (self.total_gemm_time + self.total_split_time + self.total_bias_time + self.total_expand_time) / self.total_calls
+                avg_traditional_total = (self.total_traditional_qkv_time + self.total_traditional_lora_time) / self.traditional_calls
+                speedup = avg_traditional_total / avg_fused if avg_fused > 0 else 0.0
+                
+                print(f"\n🔥 Method Comparison Analysis:")
+                print(f"Fused Method Core (GEMM+Split+Bias+Expand): {avg_fused:.3f} ms")
+                print(f"Traditional Method (QKV+LoRA):              {avg_traditional_total:.3f} ms")
+                print(f"Speedup Ratio:                               {speedup:.2f}x")
+                if speedup > 1.0:
+                    print(f"✅ Fused method is {speedup:.2f}x FASTER than traditional")
+                elif speedup < 1.0:
+                    print(f"⚠️  Traditional method is {1/speedup:.2f}x FASTER than fused")
+                else:
+                    print(f"⚖️  Both methods have similar performance")
+            
+            print(f"=== ✅ End Timing Report ===\n")
+        
+        return final_output
 
     @classmethod
     @_not_fully_sharded_can_replace
