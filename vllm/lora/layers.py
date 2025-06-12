@@ -932,6 +932,12 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
     def _compute_traditional(self, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         """传统的QKV+LoRA计算方法，用于验证"""
+        print(f"\n📋 传统方法设备检查:")
+        print(f"   输入 x: shape={x.shape}, device={x.device}")
+        if bias is not None:
+            print(f"   bias: shape={bias.shape}, device={bias.device}")
+        print(f"   base_layer.weight: shape={self.base_layer.weight.shape}, device={self.base_layer.weight.device}")
+        
         # 传统方法的分阶段计时
         if self.timing_enabled:
             start_trad_qkv = torch.cuda.Event(enable_timing=True)
@@ -943,6 +949,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
             start_trad_qkv.record()
         
         qkv_output = F.linear(x, self.base_layer.weight, bias)
+        print(f"   QKV输出: shape={qkv_output.shape}, device={qkv_output.device}")
         
         if self.timing_enabled:
             end_trad_qkv.record()
@@ -951,6 +958,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         if self.lora_a_stacked is not None and len(self.lora_a_stacked) > 0:
             x_flat = x.flatten(0, 1) if x.ndim == 3 else x
             qkv_output_flat = qkv_output.flatten(0, 1) if qkv_output.ndim == 3 else qkv_output
+            print(f"   LoRA输入扁平化: x_flat.device={x_flat.device}, qkv_output_flat.device={qkv_output_flat.device}")
             self.punica_wrapper.add_lora_linear(
                 qkv_output_flat,
                     x_flat,
@@ -986,6 +994,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
             print(f"  Avg LoRA Computation: {self.total_traditional_lora_time / self.traditional_calls:.3f} ms")
             print(f"  Avg Traditional Total: {(self.total_traditional_qkv_time + self.total_traditional_lora_time) / self.traditional_calls:.3f} ms")
             
+        print(f"📋 传统方法最终输出: shape={qkv_output.shape}, device={qkv_output.device}")
         return qkv_output
 
     def _compare_and_validate_outputs(self, 
@@ -1037,6 +1046,11 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         # 下面的代码意思是：如果环境变量VLLM_ENABLE_QKV_LORA_FUSION为0，则不使用融合优化，使用传统方法
         if os.environ.get("VLLM_ENABLE_QKV_LORA_FUSION", "0") == "0":
             return self._compute_traditional(x, bias)
+        
+        # 检查是否启用终极融合内核
+        if os.environ.get("VLLM_ENABLE_ULTIMATE_FUSION", "0") == "1":
+            return self._compute_ultimate_fusion(x, bias)
+            
         # CUDA Events for timing
         if self.timing_enabled:
             start_overall = torch.cuda.Event(enable_timing=True)
@@ -1210,6 +1224,94 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
             print(f"=== ✅ End Timing Report ===\n")
         
         return final_output
+
+    def _compute_ultimate_fusion(self, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """使用终极融合内核的计算方法"""
+        try:
+            from vllm.lora.punica_wrapper.cuda_punica.ultimate_fusion_ctypes_wrapper import cuda_ultimate_fusion_interface
+            
+            print("\n🚀 使用终极融合内核...")
+            print(f"🔍 输入维度调试: x.shape={x.shape}, x.device={x.device}")
+            if bias is not None:
+                print(f"🔍 Bias维度调试: bias.shape={bias.shape}, bias.device={bias.device}")
+            
+            # 准备输入
+            x_flat = x.flatten(0, 1) if x.ndim == 3 else x
+            num_tokens = x_flat.shape[0]
+            
+            print(f"🔍 处理后输入: x_flat.shape={x_flat.shape}, x_flat.device={x_flat.device}, num_tokens={num_tokens}")
+            
+            # 获取Punica元数据
+            meta_args = self.punica_wrapper.token_mapping_meta.meta_args(num_tokens)
+            (
+                _,
+                token_indices_sorted,         
+                num_tokens_per_lora,          
+                lora_token_start_loc,         
+                lora_ids,                     
+                no_lora_flag,                 
+            ) = meta_args
+            
+            print(f"🔍 Punica元数据: lora_ids={lora_ids}, lora_ids.device={lora_ids.device}")
+            print(f"🔍 Token映射: token_indices_sorted.shape={token_indices_sorted.shape}, device={token_indices_sorted.device}")
+            print(f"🔍 其他元数据设备:")
+            print(f"   num_tokens_per_lora.device={num_tokens_per_lora.device}")
+            print(f"   lora_token_start_loc.device={lora_token_start_loc.device}")
+            
+            # 准备QKV权重（使用原始权重，不需要转置）
+            qkv_weights = self.base_layer.weight.contiguous()  # [qkv_output_size, hidden_size]
+            print(f"🔍 QKV权重: qkv_weights.shape={qkv_weights.shape}, device={qkv_weights.device}")
+            print(f"🔍 输出切片: output_slices={self.output_slices}")
+            
+            # 检查LoRA权重维度和设备
+            print(f"🔍 LoRA A维度和设备:")
+            for i, lora_a in enumerate(self.lora_a_stacked):
+                print(f"   slice {i}: shape={lora_a.shape}, device={lora_a.device}")
+            print(f"🔍 LoRA B维度和设备:")
+            for i, lora_b in enumerate(self.lora_b_stacked):
+                print(f"   slice {i}: shape={lora_b.shape}, device={lora_b.device}")
+            
+            # 调用终极融合内核
+            print("🔧 准备调用终极融合内核...")
+            output = cuda_ultimate_fusion_interface(
+                inputs=x_flat,
+                qkv_weights=qkv_weights,
+                lora_a_stacked=self.lora_a_stacked,
+                lora_b_stacked=self.lora_b_stacked,
+                output_slices=self.output_slices,
+                token_indices_sorted=token_indices_sorted,
+                num_tokens_per_lora=num_tokens_per_lora,
+                lora_token_start_loc=lora_token_start_loc,
+                lora_ids=lora_ids,
+            )
+            
+            print(f"✅ 终极融合内核输出: output.shape={output.shape}, device={output.device}")
+            
+            # 添加bias（现在内核稳定了，可以安全处理bias）
+            if bias is not None:
+                print(f"🔧 添加bias: bias.shape={bias.shape}, output.shape={output.shape}")
+                # bias应该和output的最后一个维度匹配
+                if bias.shape[0] == output.shape[1]:
+                    output = output + bias
+                    print(f"✅ Bias添加成功: 最终output.shape={output.shape}")
+                else:
+                    print(f"⚠️ Bias维度不匹配: bias.shape[0]={bias.shape[0]}, output.shape[1]={output.shape[1]}")
+                    print(f"🔄 跳过bias添加以避免错误")
+            else:
+                print("📋 没有bias需要添加")
+            
+            # 恢复原始形状
+            final_output = output.view_as(x) if x.ndim == 3 else output
+            print(f"✅ 最终输出: final_output.shape={final_output.shape}, device={final_output.device}")
+            
+            print("✅ 终极融合内核计算完成!")
+            return final_output
+            
+        except Exception as e:
+            print(f"❌ 终极融合内核失败: {e}")
+            print("🔄 回退到传统方法...")
+            # 回退到传统方法
+            return self._compute_traditional(x, bias)
 
     @classmethod
     @_not_fully_sharded_can_replace

@@ -6,6 +6,7 @@
 #include "lora_expand_kernel.h"
 #include "lora_shrink_kernel.h"
 #include "lora_fused_expand_kernel.h"
+#include "ultimate_fusion_kernel.h"
 
 extern "C" {
 
@@ -154,6 +155,69 @@ int cuda_lora_fused_expand_c(
         }
     } catch (...) {
         fprintf(stderr, "Unknown exception in CUDA fused expand kernel\n");
+        return 1;  // Error
+    }
+    return 0; // Success
+}
+
+// Ultimate Fusion C interface - 终极融合内核
+int cuda_ultimate_fusion_c(
+    const void* input_ptr,
+    const void* qkv_weights_ptr,
+    const void* lora_a_ptr_array,
+    const void* lora_b_ptr_array,
+    void* output_ptr,
+    const int* token_indices_sorted_ptr,
+    const int* lora_ids_ptr,
+    const int* num_tokens_per_lora_ptr,
+    const int* lora_token_start_loc_ptr,
+    const int* slice_starts_ptr,
+    const int* lora_ranks_ptr,
+    int max_active_loras,
+    int num_tokens,
+    int hidden_size,
+    int qkv_output_size,
+    int num_slices,
+    int max_rank,
+    int input_stride0,
+    int input_stride1,
+    int qkv_stride0,
+    int qkv_stride1,
+    int lora_a_stride0,
+    int lora_a_stride1,
+    int lora_a_stride2,
+    int lora_b_stride0,
+    int lora_b_stride1,
+    int lora_b_stride2,
+    int output_stride0,
+    int output_stride1,
+    void* stream_ptr,
+    int input_dtype,
+    int output_dtype
+) {
+    cudaStream_t stream = (stream_ptr == nullptr) ? 0 : static_cast<cudaStream_t>(stream_ptr);
+    
+    try {
+        launch_ultimate_fusion_kernel(
+            input_ptr, qkv_weights_ptr, lora_a_ptr_array, lora_b_ptr_array,
+            output_ptr, token_indices_sorted_ptr, lora_ids_ptr,
+            num_tokens_per_lora_ptr, lora_token_start_loc_ptr, slice_starts_ptr,
+            lora_ranks_ptr, max_active_loras, num_tokens, hidden_size,
+            qkv_output_size, num_slices, max_rank, input_stride0, input_stride1,
+            qkv_stride0, qkv_stride1, lora_a_stride0, lora_a_stride1,
+            lora_a_stride2, lora_b_stride0, lora_b_stride1, lora_b_stride2,
+            output_stride0, output_stride1, stream, input_dtype, output_dtype
+        );
+        
+        cudaStreamSynchronize(stream);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "CUDA ultimate fusion kernel launch error: %s\n",
+                    cudaGetErrorString(err));
+            return 1;  // Error
+        }
+    } catch (...) {
+        fprintf(stderr, "Unknown exception in CUDA ultimate fusion kernel\n");
         return 1;  // Error
     }
     return 0; // Success

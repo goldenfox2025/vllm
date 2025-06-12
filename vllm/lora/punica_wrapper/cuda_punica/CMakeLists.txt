@@ -83,6 +83,7 @@ set(CUDA_SOURCES
     lora_shrink_kernel.cu
     lora_expand_kernel.cu
     lora_fused_expand_kernel.cu
+    ultimate_fusion_kernel.cu
 )
 set(C_SOURCES
     c_wrapper.cpp
