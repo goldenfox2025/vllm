@@ -76,11 +76,14 @@ def cuda_lora_expand_triton_interface(
     """
     CUDA LoRA expand using Triton-compatible interface
     """
+
     if not C_LIB_AVAILABLE:
         return False
 
     try:
         # Early exit check
+
+      
         assert no_lora_flag_cpu.numel() == 1
         if no_lora_flag_cpu.item():
             return True
@@ -165,6 +168,9 @@ def cuda_lora_expand_triton_interface(
         # Calculate active LoRA count
         active_lora_count = sum(1 for lora_id in lora_ids.tolist())
         max_active_loras = active_lora_count
+        # 打印所有输入数据的设备
+        
+     
 
         # Call the CUDA kernel
         result = cuda_c_lib.cuda_lora_expand_c(

@@ -275,7 +275,6 @@ void lora_expand_kernel_impl(
     int num_slices, bool add_inputs, int input_d0_stride, int input_d1_stride,
     int input_d2_stride, int output_d0_stride, int output_d1_stride,
     cudaStream_t stream) {
-  // 修复：Grid 和 Block 配置，使用GPU兼容的配置
   // Triton使用BLOCK_M=64, BLOCK_N=128，但CUDA需要考虑线程数限制
   // 最大线程数通常是1024，所以使用较小的block配置
   const int BLOCK_M = 16;  // 每个block在M维(token)处理的元素数量

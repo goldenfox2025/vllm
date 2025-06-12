@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find required packages
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-find_package(pybind11 REQUIRED) # Found for potential future use in Python bindings
+# find_package(pybind11 REQUIRED) # 移除pybind11依赖，我们只构建C库
 find_package(CUDA REQUIRED)
 enable_language(CUDA)
 
@@ -103,13 +103,6 @@ set_target_properties(cuda_lora_c PROPERTIES
 # PyTorch (Torch::torch) is not linked here, assuming c_wrapper.cpp and CUDA kernels
 # do not directly depend on PyTorch's C++ API for this target.
 target_link_libraries(cuda_lora_c PRIVATE ${CUDA_LIBRARIES})
-
-# --- Pybind11 Integration Notes ---
-# If c_wrapper.cpp were a pybind11 wrapper, you would:
-# 1. Add pybind11_INCLUDE_DIRS to include_directories.
-# 2. Link Python3::Python, pybind11::module (or pybind11::embed), and potentially Torch::torch
-#    to a pybind11_add_module target.
-# For now, pybind11 is found but not actively used for the cuda_lora_c SHARED target.
 
 # Informational messages (useful for debugging build configurations)
 message(STATUS "CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
