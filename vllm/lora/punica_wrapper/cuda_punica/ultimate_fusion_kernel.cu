@@ -572,17 +572,6 @@ void launch_ultimate_fusion_kernel(
         input_stride1, qkv_stride0, qkv_stride1, lora_a_stride0, lora_a_stride1,
         lora_a_stride2, lora_b_stride0, lora_b_stride1, lora_b_stride2,
         output_stride0, output_stride1, stream, max_active_loras);
-  } else if (input_dtype == 2 && output_dtype == 2) {  // float -> float
-    ultimate_fusion_kernel_impl_v1<float, float>(
-        static_cast<const float*>(input_ptr),
-        static_cast<const float*>(qkv_weights_ptr), lora_a_ptr_array,
-        lora_b_ptr_array, static_cast<float*>(output_ptr),
-        token_indices_sorted_ptr, lora_ids_ptr, num_tokens_per_lora_ptr,
-        lora_token_start_loc_ptr, slice_starts_ptr, lora_ranks_ptr, num_tokens,
-        hidden_size, qkv_output_size, num_slices, max_rank, input_stride0,
-        input_stride1, qkv_stride0, qkv_stride1, lora_a_stride0, lora_a_stride1,
-        lora_a_stride2, lora_b_stride0, lora_b_stride1, lora_b_stride2,
-        output_stride0, output_stride1, stream, max_active_loras);
   } else {
     std::cerr << "Ultimate fusion kernel: Unsupported dtype combination: input="
               << input_dtype << ", output=" << output_dtype << std::endl;
