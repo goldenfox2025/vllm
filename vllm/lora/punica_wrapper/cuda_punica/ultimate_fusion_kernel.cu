@@ -290,58 +290,62 @@ void ultimate_fusion_kernel_impl(
     // launch error: %s\n", cudaGetErrorString(err));
   }
 }
-/**
- * @brief V1融合CUDA内核
- */
+
 template <typename InputT, typename OutputT, int BM, int BK, int BN,
-          int THREADS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
-__global__ void ultimate_fusion_kernel_v1(
+          int THREADS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K,
+          int max_rank = 128>
+__global__ void ultimate_fusion_kernel_v2(
     const InputT* input_ptr, const InputT* qkv_weights_ptr,
     const void* lora_a_ptr_array, const void* lora_b_ptr_array,
     OutputT* output_ptr, const int* token_indices_sorted_ptr,
     const int* lora_ids_ptr, const int* num_tokens_per_lora_ptr,
     const int* lora_token_start_loc_ptr, const int* slice_starts_ptr,
     const int* lora_ranks_ptr, int num_tokens, int hidden_size,
-    int qkv_output_size, int num_slices, int max_rank,
+    int qkv_output_size, int num_slices, int max_rank_default,
     // strides
     int input_stride0, int input_stride1, int qkv_stride0, int qkv_stride1,
     int lora_a_stride0, int lora_a_stride1, int lora_a_stride2,
     int lora_b_stride0, int lora_b_stride1, int lora_b_stride2,
     int output_stride0, int output_stride1) {
   int lora_id = blockIdx.x;
-  int slice_id = blockIdx.y;
-  const int width_in_blocks = (qkv_output_size + max_rank + BN - 1) / BN;
+  // NOTE: blockIdx.y is not used for slicing to allow for flexibility in the
+  // grid definition. Instead, slice_id is determined from cta_n_idx later.
+
+  const int width_in_blocks = (qkv_output_size + max_rank * num_slices) / BN;
 
   int cta_m_idx = blockIdx.z / width_in_blocks;
   int cta_n_idx = blockIdx.z % width_in_blocks;
 
   int lora_idx = lora_ids_ptr[lora_id];
 
+  using namespace nvcuda;
+
+  // 定义WMMA fragments
+  using FragmentA = wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
+                                   InputT, wmma::row_major>;
+  using FragmentB = wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
+                                   InputT, wmma::row_major>;
+  using FragmentC =
+      wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+
+  // 这个逻辑决定了每个warp负责计算输出瓦片的哪个16x16部分
+  const int warps_in_m_dim = BM / WMMA_M;
+  const int warps_in_n_dim = BN / WMMA_N;
+  const int warp_id = threadIdx.x / warpSize;
+  const int warp_m = warp_id / warps_in_n_dim;
+  const int warp_n = warp_id % warps_in_n_dim;
+
   if (lora_idx == -1) {
     __shared__ InputT s_a[BM * BK];
     __shared__ InputT s_b[BK * BN];
-
-    using namespace nvcuda;
-
-    // 定义WMMA fragments
-    using FragmentA = wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
-                                     InputT, wmma::row_major>;
-    using FragmentB = wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
-                                     InputT, wmma::row_major>;
-    using FragmentC =
-        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
-
-    // 这个逻辑决定了每个warp负责计算输出瓦片的哪个16x16部分
-    const int warps_in_n_dim = BN / WMMA_N;
-    const int warp_id = threadIdx.x / warpSize;
-    const int warp_m = warp_id / warps_in_n_dim;
-    const int warp_n = warp_id % warps_in_n_dim;
+    __shared__ float smem_output[BM * BN];
 
     // 每个warp在自己的私有寄存器中创建一个累加器片段，并清零
     FragmentC frag_c;
-    wmma::fill_fragment(frag_c, OutputT(0));
+    wmma::fill_fragment(frag_c, 0.0f);
 
     for (int k_tile_start = 0; k_tile_start < hidden_size; k_tile_start += BK) {
+      // 加载input
       for (int i = threadIdx.x; i < BM * BK; i += blockDim.x) {
         int m = i / BK;
         int k = i % BK;
@@ -356,14 +360,16 @@ __global__ void ultimate_fusion_kernel_v1(
         }
       }
 
+      // 加载qkv权重
       for (int i = threadIdx.x; i < BK * BN; i += blockDim.x) {
         int k = i / BN;
         int n = i % BN;
-        int weight_row = cta_n_idx * BN + n;
-        int hidden_col = k_tile_start + k;
-        if (weight_row < qkv_output_size && hidden_col < hidden_size) {
+        int weight_row = k_tile_start + k;
+        int weight_col =
+            cta_n_idx * BN + n;  // Corrected: qkv is (hidden, qkv_out) layout
+        if (weight_col < qkv_output_size && weight_row < hidden_size) {
           s_b[k * BN + n] = qkv_weights_ptr[weight_row * qkv_stride0 +
-                                            hidden_col * qkv_stride1];
+                                            weight_col * qkv_stride1];
         } else {
           s_b[k * BN + n] = InputT(0);
         }
@@ -390,21 +396,25 @@ __global__ void ultimate_fusion_kernel_v1(
       __syncthreads();  // 确保所有warp都完成了对当前瓦片的计算
     }
 
-    // 计算每个warp负责的16x16瓦片在全局内存中的目标地址
-    // 暂时不确定直接存全局更快还是存smem更快
-    int output_row = cta_m_idx * BM + warp_m * WMMA_M;
-    int output_col = cta_n_idx * BN + warp_n * WMMA_N;
-    __shared__ float smem_output[BM * BN];
-
-    wmma::store_matrix_sync(smem_output + output_row * BN + output_col, frag_c,
-                            BN, wmma::mem_row_major);
+    // 每个warp负责的16x16瓦片存储到共享内存的目标地址
+    int smem_warp_row_offset = warp_m * WMMA_M;
+    int smem_warp_col_offset = warp_n * WMMA_N;
+    wmma::store_matrix_sync(
+        smem_output + smem_warp_row_offset * BN + smem_warp_col_offset, frag_c,
+        BN, wmma::mem_row_major);
     __syncthreads();
-    for (int i = 0; i < BM; i++) {
-      for (int j = 0; j < BN; j++) {
-        int output_row = cta_m_idx * BM + i;
-        int output_col = cta_n_idx * BN + j;
+
+    // 输出
+    for (int i = threadIdx.x; i < BM * BN; i += blockDim.x) {
+      int m_local = i / BN;
+      int n_local = i % BN;
+
+      int output_row = cta_m_idx * BM + m_local;
+      int output_col = cta_n_idx * BN + n_local;
+
+      if (output_row < num_tokens && output_col < qkv_output_size) {
         output_ptr[output_row * output_stride0 + output_col * output_stride1] =
-            static_cast<OutputT>(smem_output[i * BN + j]);
+            static_cast<OutputT>(smem_output[i]);
       }
     }
     return;  // 基础任务完成，直接返回
@@ -412,98 +422,105 @@ __global__ void ultimate_fusion_kernel_v1(
     // 这个分支的全局内存不合并可能会比较严重
     // 按照lora_idx来索引对应的token
     int lora_m_size = num_tokens_per_lora_ptr[lora_idx];
-
-    // v1版本不考虑slice并行
-    // 排序后的索引的开始部分
     const int lora_m_idx_start = lora_token_start_loc_ptr[lora_idx];
 
-    __shared__ InputT smem_input[BM * BK];
-    __shared__ InputT smem_qkv[BN * Bk];
-    __shared__ InputT smem_loraA[max_rank * BK];
-    __shared__ InputT smem_loraB[max_rank * BK];
-    // 逻辑视图上讲
-    // [qkv_output_size + max_rank * num_slices, input_size]
-    // N维度也是以上面为基础划分的
-    // 为了方便处理，在这里规定：
-    // qkv_output_size % BN == 0
-    // 这样即确保一个单独的线程块处理loraA
+    // FinalOutput = I*QKV + (I*A)*B
+    __shared__ InputT s_input[BM * BK];
+    __shared__ InputT s_qkv_weights[BK * BN];
+
+    // __shared__ float s_intermediate[BM * max_rank];
 
     const uintptr_t* ptr_values_a =
         reinterpret_cast<const uintptr_t*>(lora_a_ptr_array);
     const uintptr_t* ptr_values_b =
         reinterpret_cast<const uintptr_t*>(lora_b_ptr_array);
 
-    // 空指针检查F
     if (ptr_values_a == nullptr || ptr_values_b == nullptr) {
       return;
     }
-    // 根据堆叠方式不同
-    // lora1_slice1,lora2_slice1...
+    // 确认是否是lora slice
+    bool is_lora_slice = cta_n_idx * BN - qkv_output_size > 0;
 
-    bool is_lora = cta_n_idx * BN >= qkv_output_size;
-    // 因为假设qkv_output_size % BN == 0 所以这里可以用于判断是否是lora计算
+    // 回过头来，先放弃花里胡哨的想法
+    // 一个能跑的方案究竟是什么？
 
-    // 这样一来，也就获得了loraA和loraB的指针
+    // is_lora_slice为true时，需要计算lora_a和lora_b
+    // 斟酌之下，确认分支处理为上
+    // 线程块的划分是基于 qkv_output_size + max_rank * num_slices 的
+    // 即便从理论上分析，这应该也是最佳的
+    // 第一阶段，所有线程块理论上计算负载差不多，但loraA分支的smem占用会多一些
+    // loraA分支的线程块，按照max_rank为128来分析，输入tokens为10
+    // 仅分配到4 * 10个线程块
+    // 如果max_rank更小，比如16，那么实际上也就10个线程块
+    // 第一阶段其实好说。
+    // 如果不写回全局，第二阶段开始，
+    // 这10个线程块负责[tokens,rank]和[rank,output_size]的计算
+    // 完全打不满
+    // 这个在写shrink的时候测过了
+    // spiltK的CUDA版本在部分场景下能有接近翻倍的提升（ncu还是准的）
+    // 但是非spiltK，线程块要少得多
+    // 速度也就慢得多，甚至连一半都难得达到。甚至是十分之一。
+    // 这一部分也要研究。我不太清楚输入数据是如何影响性能提升百分比的
+    // 或者说本可以打满 但必须写回全局
+    // 也就是说，不能有方案上的创新
+    // 本质上和torch.matmul + fused expand的路径是一致的
+    // 这10个线程块写回全局
+    // 更多的线程块读到它们，然后在output_size上去读
+    // 其实这里本可以提高并行性，那就是切slice
+    // 那qkv并行呢？
+    // 难道要按照1536 256 256来分配线程块？那本质上不就是BN切割么？
+    // 对了。就是这样
+    // 这种大融合第一解决了启动开销
+    // 但在graph下谈启动开销没意义
+    // 第二，可以提高并行性
+    // 如果矩阵乘优化得好，至少比shrink的splitk要快一些
+    // 但之前的测量也是在wsl上做的，偶尔不准。所以做不得数
+    // 这最简单的修改就是多流
+    // 但根据flash
+    // attention拆kv的经验，多流确实没有一个核启动多线程块好（前提是优化水准相同）
+    // 而且cuda graph捕获多流的操作……应该是没搞懂，总之会有bug
+    // 项目好一段时间没动了。也必须动一动。
 
-    // 接下来要完成的工作，是想办法一次性处理loraA和qkv
-    // 以之前提到的[qkv_output_size + max_rank * num_slices, input_size]为目标
 
-    // 下面是获取每个slice对应的lora权重的方法和slice长度的方法。但注意，grid仅根据如下要求分块
-    // dim3 grid(max_active_loras, 1,
-    // num_tokens * (qkv_output_size + max_rank * num_slices) / (BM * BN));
-    // 因为qkv是整体的！所以slice必须也是整体的！真要说slice分块，也必然是z轴的num_tokens
-    // * (qkv_output_size + max_rank * num_slices) / (BM * BN)在起效
-    // 不允许修改启动参数
-    // 下面的slice相关代码是无意义的，只是给你一个参考
-    for (int slice_id = 0; slice_id < num_slices; slice_id++) {
-      // 获取当前slice的LoRA A权重指针 大小为max_rank * input_size
-      uintptr_t lora_a_addr = ptr_values_a[slice_id][lora_idx];
+    // 总而言之，先前的实现都可以放弃了
+    // shrink是一个障碍。
+    // 根据经验，sm打满远比HBM读写更重要
+    // 因此全局内存写回不可避免
+    // 之后在速度稳定的机器上进行一下对比
+    // 也许fused expand路径会更快
+    // 当然，本内核如果优化程度足够高，肯定能比空算版更好
+    
 
-      const InputT* cur_lora_a_ptr =
-          reinterpret_cast<const InputT*>(lora_a_addr);
-      // 获取当前slice的LoRA B权重指针 这个读取方法也只是一个示意
-      uintptr_t lora_b_addr = ptr_values_b[slice_id][lora_idx];
-      const InputT* cur_lora_b_ptr =
-          reinterpret_cast<const InputT*>(lora_b_addr);
+    // 此外，V1原始版本，稍微大点处理块，4070laptop就会爆寄存器/smem
+    // 当然，可以做寄存器复用。共享内存也可以复用……但估计希望不大
+    // 主要是接近爆寄存器或smem的程度占用率一定会跌得很厉害
+    // 横竖都要写回全局内存，分两个内核才是合理的
 
-      int slice_start = slice_starts_ptr[slice_id];
-      int slice_end = (slice_id + 1 < num_slices)
-                          ? slice_starts_ptr[slice_id + 1]
-                          : qkv_output_size;
-      int slice_size = slice_end - slice_start;
+    // 感觉三个完全融合意义不是太大
+
+    if (is_lora_slice) {
+      // 计算lora_a
+      // 将3个slice的loraA读到smem里
+    } else {
+      // 计算qkv 如-1分支
     }
 
-    for (int tile_K_start = 0;
-         tile_K_start < qkv_output_size + max_rank * num_slices;
-         tile_K_start += BK) {
-      // load input
+    // 写回intermediate到HBM
 
-      // load qkv
+    // 各个线程块开始发挥作用，从全局内存读取intermediate
+    // 读取loraB到smem
+    // 完成计算
 
-      // load loraA
+    // 非常遗憾，发现只能搞定这样的实现
+    // 那么之后就要学cute了
+    // ldmatrix可以用来适配swizzle，但写起来好麻烦。
 
-      // 计算
-      for (int k_step = 0; k_step < BK; k_step += WMMA_K) {
-        // WARP数为BN / WMMA_N * BM / WMMA_M
-        // num_tokens * (qkv_output_size + max_rank * num_slices) / (BM * BN)
-        // 也就是将loraA的计算也视作是一个逻辑上的输出部分
-        // 或许可以新设立一个smem_output用于暂存
+    // 感觉cute如果写好了会更快
 
-        // is_lora分支
-        // 而qkv_output_size可以被BN整除
-        // cta_n_idx * BN > qkv_output_size 时，是lora计算
-        // 三个指针（num slices的大小）索引对应的loraA
-        // 此时，应当已经加载到smem_loraA当中
-        // 计算得出对应的intermediate
-      }
-    }
-    // 计算循环结束后，每个WARP应该都计算出了一个16x16的瓦片
-    // 当然也包括is_lora分支
-    // 接下来，需要调取loraB进行计算
-    // 这一部分也可以考虑放到上面的循环，视作张量并行，但可能意义不大，先放在这里，至少实现一个成功的版本
-    // 负责is_lora分支的WARP，读取loraB，计算出最终输出
+    // 清空实现，考虑另一种方案
   }
 }
+
 /**
  * @brief V1 内核实现模板函数
  */
@@ -527,13 +544,17 @@ void ultimate_fusion_kernel_impl_v1(
   constexpr int WMMA_N = 16;
   constexpr int WMMA_K = 16;
   constexpr int WARP_SIZE = 32;
-  constexpr int THREADS_PER_BLOCK = WARP_SIZE * BM / WMMA_M * BN / WMMA_N;
+
+  constexpr int WARPS_IN_M = BM / WMMA_M;
+  constexpr int WARPS_IN_N = BN / WMMA_N;
+  constexpr int THREADS_PER_BLOCK = WARP_SIZE * WARPS_IN_M * WARPS_IN_N;
 
   // 进行一次伟大的尝试
   // 每个CTA根据索引处理对应的数据
-  // 暂时不考虑slice并行
-  dim3 grid(max_active_loras, 1,
-            num_tokens * (qkv_output_size + max_rank * num_slices) / (BM * BN));
+
+  const int z_grid_dim =
+      ((num_tokens + BM - 1) / BM) * ((qkv_output_size + BN - 1) / BN);
+  dim3 grid(max_active_loras, 1, z_grid_dim);
 
   dim3 block(THREADS_PER_BLOCK);
   // 启动V1内核
@@ -553,9 +574,9 @@ void ultimate_fusion_kernel_impl_v1(
     printf("V1 kernel launch error: %s\n", cudaGetErrorString(err));
   }
 }
-/**
- * @brief 公开的启动函数
- */
+
+
+
 void launch_ultimate_fusion_kernel(
     const void* input_ptr, const void* qkv_weights_ptr,
     const void* lora_a_ptr_array, const void* lora_b_ptr_array,
@@ -571,7 +592,7 @@ void launch_ultimate_fusion_kernel(
     int input_dtype, int output_dtype) {
   // 根据数据类型分发
   if (input_dtype == 0 && output_dtype == 0) {  // fp16 -> fp16
-    ultimate_fusion_kernel_impl_v1<__half, __half>(
+    ultimate_fusion_kernel_impl<__half, __half>(
         static_cast<const __half*>(input_ptr),
         static_cast<const __half*>(qkv_weights_ptr), lora_a_ptr_array,
         lora_b_ptr_array, static_cast<__half*>(output_ptr),
@@ -582,7 +603,7 @@ void launch_ultimate_fusion_kernel(
         lora_a_stride2, lora_b_stride0, lora_b_stride1, lora_b_stride2,
         output_stride0, output_stride1, stream, max_active_loras);
   } else if (input_dtype == 1 && output_dtype == 1) {  // bf16 -> bf16
-    ultimate_fusion_kernel_impl_v1<__nv_bfloat16, __nv_bfloat16>(
+    ultimate_fusion_kernel_impl<__nv_bfloat16, __nv_bfloat16>(
         static_cast<const __nv_bfloat16*>(input_ptr),
         static_cast<const __nv_bfloat16*>(qkv_weights_ptr), lora_a_ptr_array,
         lora_b_ptr_array, static_cast<__nv_bfloat16*>(output_ptr),

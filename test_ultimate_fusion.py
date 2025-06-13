@@ -7,7 +7,7 @@ import torch
 import sys
 
 # 设置环境变量
-os.environ["VLLM_ENABLE_ULTIMATE_FUSION"] = "1"
+# os.environ["VLLM_ENABLE_ULTIMATE_FUSION"] = "1"
 os.environ["VLLM_ENABLE_TIMING"] = "1"
 
 def test_ultimate_fusion_standalone():
