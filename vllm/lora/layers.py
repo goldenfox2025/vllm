@@ -1226,22 +1226,28 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         return final_output
 
     def _compute_ultimate_fusion(self, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """使用终极融合内核的计算方法"""
+        """使用终极融合内核的计算方法 - CUDA Graph兼容版本"""
         try:
             from vllm.lora.punica_wrapper.cuda_punica.ultimate_fusion_ctypes_wrapper import cuda_ultimate_fusion_interface
             
-            print("\n🚀 使用终极融合内核...")
-            print(f"🔍 输入维度调试: x.shape={x.shape}, x.device={x.device}")
-            if bias is not None:
-                print(f"🔍 Bias维度调试: bias.shape={bias.shape}, bias.device={bias.device}")
+            # 检测CUDA Graph capture状态
+            is_capturing = torch.cuda.is_current_stream_capturing()
             
-            # 准备输入
+            # 只在非capture模式下打印调试信息
+            if not is_capturing:
+                print("\n🚀 使用终极融合内核...")
+                print(f"🔍 输入维度调试: x.shape={x.shape}, x.device={x.device}")
+                if bias is not None:
+                    print(f"🔍 Bias维度调试: bias.shape={bias.shape}, bias.device={bias.device}")
+            
+            # 准备输入 - 确保所有操作都兼容CUDA Graph
             x_flat = x.flatten(0, 1) if x.ndim == 3 else x
             num_tokens = x_flat.shape[0]
             
-            print(f"🔍 处理后输入: x_flat.shape={x_flat.shape}, x_flat.device={x_flat.device}, num_tokens={num_tokens}")
+            if not is_capturing:
+                print(f"🔍 处理后输入: x_flat.shape={x_flat.shape}, x_flat.device={x_flat.device}, num_tokens={num_tokens}")
             
-            # 获取Punica元数据
+            # 获取Punica元数据 - 这个操作必须是CUDA Graph兼容的
             meta_args = self.punica_wrapper.token_mapping_meta.meta_args(num_tokens)
             (
                 _,
@@ -1252,27 +1258,31 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
                 no_lora_flag,                 
             ) = meta_args
             
-            print(f"🔍 Punica元数据: lora_ids={lora_ids}, lora_ids.device={lora_ids.device}")
-            print(f"🔍 Token映射: token_indices_sorted.shape={token_indices_sorted.shape}, device={token_indices_sorted.device}")
-            print(f"🔍 其他元数据设备:")
-            print(f"   num_tokens_per_lora.device={num_tokens_per_lora.device}")
-            print(f"   lora_token_start_loc.device={lora_token_start_loc.device}")
+            if not is_capturing:
+                print(f"🔍 Punica元数据: lora_ids={lora_ids}, lora_ids.device={lora_ids.device}")
+                print(f"🔍 Token映射: token_indices_sorted.shape={token_indices_sorted.shape}, device={token_indices_sorted.device}")
+                print(f"🔍 其他元数据设备:")
+                print(f"   num_tokens_per_lora.device={num_tokens_per_lora.device}")
+                print(f"   lora_token_start_loc.device={lora_token_start_loc.device}")
             
             # 准备QKV权重（使用原始权重，不需要转置）
             qkv_weights = self.base_layer.weight # [qkv_output_size, hidden_size]
-            print(f"🔍 QKV权重: qkv_weights.shape={qkv_weights.shape}, device={qkv_weights.device}")
-            print(f"🔍 输出切片: output_slices={self.output_slices}")
             
-            # 检查LoRA权重维度和设备
-            print(f"🔍 LoRA A维度和设备:")
-            for i, lora_a in enumerate(self.lora_a_stacked):
-                print(f"   slice {i}: shape={lora_a.shape}, device={lora_a.device}")
-            print(f"🔍 LoRA B维度和设备:")
-            for i, lora_b in enumerate(self.lora_b_stacked):
-                print(f"   slice {i}: shape={lora_b.shape}, device={lora_b.device}")
+            if not is_capturing:
+                print(f"🔍 QKV权重: qkv_weights.shape={qkv_weights.shape}, device={qkv_weights.device}")
+                print(f"🔍 输出切片: output_slices={self.output_slices}")
+                
+                # 检查LoRA权重维度和设备
+                print(f"🔍 LoRA A维度和设备:")
+                for i, lora_a in enumerate(self.lora_a_stacked):
+                    print(f"   slice {i}: shape={lora_a.shape}, device={lora_a.device}")
+                print(f"🔍 LoRA B维度和设备:")
+                for i, lora_b in enumerate(self.lora_b_stacked):
+                    print(f"   slice {i}: shape={lora_b.shape}, device={lora_b.device}")
+                
+                print("🔧 准备调用终极融合内核...")
             
-            # 调用终极融合内核
-            print("🔧 准备调用终极融合内核...")
+            # 调用终极融合内核 - 这个函数已经是CUDA Graph兼容的
             output = cuda_ultimate_fusion_interface(
                 inputs=x_flat,
                 qkv_weights=qkv_weights,
@@ -1285,31 +1295,43 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
                 lora_ids=lora_ids,
             )
             
-            print(f"✅ 终极融合内核输出: output.shape={output.shape}, device={output.device}")
+            if not is_capturing:
+                print(f"✅ 终极融合内核输出: output.shape={output.shape}, device={output.device}")
             
-            # 添加bias（现在内核稳定了，可以安全处理bias）
+            # 添加bias（确保这个操作也是CUDA Graph兼容的）
             if bias is not None:
-                print(f"🔧 添加bias: bias.shape={bias.shape}, output.shape={output.shape}")
+                if not is_capturing:
+                    print(f"🔧 添加bias: bias.shape={bias.shape}, output.shape={output.shape}")
+                
                 # bias应该和output的最后一个维度匹配
                 if bias.shape[0] == output.shape[1]:
                     output = output + bias
-                    print(f"✅ Bias添加成功: 最终output.shape={output.shape}")
+                    if not is_capturing:
+                        print(f"✅ Bias添加成功: 最终output.shape={output.shape}")
                 else:
-                    print(f"⚠️ Bias维度不匹配: bias.shape[0]={bias.shape[0]}, output.shape[1]={output.shape[1]}")
-                    print(f"🔄 跳过bias添加以避免错误")
+                    if not is_capturing:
+                        print(f"⚠️ Bias维度不匹配: bias.shape[0]={bias.shape[0]}, output.shape[1]={output.shape[1]}")
+                        print(f"🔄 跳过bias添加以避免错误")
             else:
-                print("📋 没有bias需要添加")
+                if not is_capturing:
+                    print("📋 没有bias需要添加")
             
-            # 恢复原始形状
+            # 恢复原始形状 - 确保这个操作是CUDA Graph兼容的
             final_output = output.view_as(x) if x.ndim == 3 else output
-            print(f"✅ 最终输出: final_output.shape={final_output.shape}, device={final_output.device}")
             
-            print("✅ 终极融合内核计算完成!")
+            if not is_capturing:
+                print(f"✅ 最终输出: final_output.shape={final_output.shape}, device={final_output.device}")
+                print("✅ 终极融合内核计算完成!")
+            
             return final_output
             
         except Exception as e:
-            print(f"❌ 终极融合内核失败: {e}")
-            print("🔄 回退到传统方法...")
+            # 错误处理也要考虑CUDA Graph兼容性
+            is_capturing = torch.cuda.is_current_stream_capturing()
+            if not is_capturing:
+                print(f"❌ 终极融合内核失败: {e}")
+                print("🔄 回退到传统方法...")
+            
             # 回退到传统方法
             return self._compute_traditional(x, bias)
 
