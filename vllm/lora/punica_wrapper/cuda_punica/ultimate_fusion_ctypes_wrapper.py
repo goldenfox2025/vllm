@@ -241,7 +241,11 @@ def cuda_ultimate_fusion_interface(
     # 验证LoRA权重 - 但不做任何修改
     lora_a_processed = []
     lora_b_processed = []
-    
+  
+  
+    # 按照slice逐个处理
+    # lora1_slice1,lora2_slice1...
+    # 这是处理方法一，适合朴素融合 + slice分块
     for i, (lora_a, lora_b) in enumerate(zip(lora_a_stacked, lora_b_stacked)):
         if not lora_a.is_cuda or not lora_b.is_cuda:
             raise ValueError(f"LoRA weights must be on CUDA device")
@@ -253,7 +257,11 @@ def cuda_ultimate_fusion_interface(
         
         if not is_capturing:
             print(f"🔧 slice[{i}]: lora_a.shape={lora_a.shape}, lora_b.shape={lora_b.shape}")
-    
+
+    # 处理方法二
+
+
+
     # 基本参数
     num_tokens = inputs.shape[0]
     hidden_size = inputs.shape[1]
