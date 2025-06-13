@@ -329,7 +329,7 @@ __global__ void ultimate_fusion_kernel_v1(
     using FragmentB = wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
                                      InputT, wmma::row_major>;
     using FragmentC =
-        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, OutputT>;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
 
     // 这个逻辑决定了每个warp负责计算输出瓦片的哪个16x16部分
     const int warps_in_n_dim = BN / WMMA_N;
@@ -394,10 +394,18 @@ __global__ void ultimate_fusion_kernel_v1(
     // 暂时不确定直接存全局更快还是存smem更快
     int output_row = cta_m_idx * BM + warp_m * WMMA_M;
     int output_col = cta_n_idx * BN + warp_n * WMMA_N;
-    if (output_row < num_tokens && output_col < qkv_output_size) {
-      wmma::store_matrix_sync(output_ptr + output_row * output_stride0 +
-                                  output_col * output_stride1,
-                              frag_c, output_stride0, wmma::mem_row_major);
+    __shared__ float smem_output[BM * BN];
+
+    wmma::store_matrix_sync(smem_output + output_row * BN + output_col, frag_c,
+                            BN, wmma::mem_row_major);
+    __syncthreads();
+    for (int i = 0; i < BM; i++) {
+      for (int j = 0; j < BN; j++) {
+        int output_row = cta_m_idx * BM + i;
+        int output_col = cta_n_idx * BN + j;
+        output_ptr[output_row * output_stride0 + output_col * output_stride1] =
+            static_cast<OutputT>(smem_output[i * BN + j]);
+      }
     }
     return;  // 基础任务完成，直接返回
   } else {
@@ -408,7 +416,6 @@ __global__ void ultimate_fusion_kernel_v1(
     // v1版本不考虑slice并行
     // 排序后的索引的开始部分
     const int lora_m_idx_start = lora_token_start_loc_ptr[lora_idx];
-
 
     __shared__ InputT smem_input[BM * BK];
     __shared__ InputT smem_qkv[BN * Bk];
@@ -436,52 +443,65 @@ __global__ void ultimate_fusion_kernel_v1(
     bool is_lora = cta_n_idx * BN >= qkv_output_size;
     // 因为假设qkv_output_size % BN == 0 所以这里可以用于判断是否是lora计算
 
-
-    // 获取当前slice的LoRA A权重指针 大小为max_rank * input_size
-    uintptr_t lora_a_addr = ptr_values_a[slice_id][lora_idx];
-    const InputT* cur_lora_a_ptr = reinterpret_cast<const InputT*>(lora_a_addr);
-    // 获取当前slice的LoRA B权重指针
-    uintptr_t lora_b_addr = ptr_values_b[slice_id][lora_idx];
-    const InputT* cur_lora_b_ptr = reinterpret_cast<const InputT*>(lora_b_addr);
     // 这样一来，也就获得了loraA和loraB的指针
-
 
     // 接下来要完成的工作，是想办法一次性处理loraA和qkv
     // 以之前提到的[qkv_output_size + max_rank * num_slices, input_size]为目标
 
-    for(int tile_K_start = 0; tile_K_start < qkv_output_size + max_rank * num_slices; tile_K_start += BK){
+    // 下面是获取每个slice对应的lora权重的方法和slice长度的方法。但注意，grid仅根据如下要求分块
+    // dim3 grid(max_active_loras, 1,
+    // num_tokens * (qkv_output_size + max_rank * num_slices) / (BM * BN));
+    // 因为qkv是整体的！所以slice必须也是整体的！真要说slice分块，也必然是z轴的num_tokens
+    // * (qkv_output_size + max_rank * num_slices) / (BM * BN)在起效
+    // 不允许修改启动参数
+    // 下面的slice相关代码是无意义的，只是给你一个参考
+    for (int slice_id = 0; slice_id < num_slices; slice_id++) {
+      // 获取当前slice的LoRA A权重指针 大小为max_rank * input_size
+      uintptr_t lora_a_addr = ptr_values_a[slice_id][lora_idx];
 
-        // load input
+      const InputT* cur_lora_a_ptr =
+          reinterpret_cast<const InputT*>(lora_a_addr);
+      // 获取当前slice的LoRA B权重指针 这个读取方法也只是一个示意
+      uintptr_t lora_b_addr = ptr_values_b[slice_id][lora_idx];
+      const InputT* cur_lora_b_ptr =
+          reinterpret_cast<const InputT*>(lora_b_addr);
 
-        // load qkv
+      int slice_start = slice_starts_ptr[slice_id];
+      int slice_end = (slice_id + 1 < num_slices)
+                          ? slice_starts_ptr[slice_id + 1]
+                          : qkv_output_size;
+      int slice_size = slice_end - slice_start;
+    }
 
-        // load loraA
+    for (int tile_K_start = 0;
+         tile_K_start < qkv_output_size + max_rank * num_slices;
+         tile_K_start += BK) {
+      // load input
 
-        // 计算
-        for(int k_step = 0; k_step < BK; k_step += WMMA_K){
-            // WARP数为BN / WMMA_N * BM / WMMA_M
-            // num_tokens * (qkv_output_size + max_rank * num_slices) / (BM * BN)
-            // 也就是将loraA的计算也视作是一个逻辑上的输出部分
-            // 或许可以新设立一个smem_output用于暂存
+      // load qkv
 
+      // load loraA
 
+      // 计算
+      for (int k_step = 0; k_step < BK; k_step += WMMA_K) {
+        // WARP数为BN / WMMA_N * BM / WMMA_M
+        // num_tokens * (qkv_output_size + max_rank * num_slices) / (BM * BN)
+        // 也就是将loraA的计算也视作是一个逻辑上的输出部分
+        // 或许可以新设立一个smem_output用于暂存
 
-            // is_lora分支
-            // 而qkv_output_size可以被BN整除
-            // cta_n_idx * BN > qkv_output_size 时，是lora计算
-            // 三个指针（num slices的大小）索引对应的loraA
-            // 此时，应当已经加载到smem_loraA当中
-            // 计算得出对应的intermediate
-
-        }
+        // is_lora分支
+        // 而qkv_output_size可以被BN整除
+        // cta_n_idx * BN > qkv_output_size 时，是lora计算
+        // 三个指针（num slices的大小）索引对应的loraA
+        // 此时，应当已经加载到smem_loraA当中
+        // 计算得出对应的intermediate
+      }
     }
     // 计算循环结束后，每个WARP应该都计算出了一个16x16的瓦片
     // 当然也包括is_lora分支
     // 接下来，需要调取loraB进行计算
     // 这一部分也可以考虑放到上面的循环，视作张量并行，但可能意义不大，先放在这里，至少实现一个成功的版本
     // 负责is_lora分支的WARP，读取loraB，计算出最终输出
-
-
   }
 }
 /**
