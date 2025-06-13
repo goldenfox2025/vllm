@@ -107,7 +107,7 @@ def create_test_llm(model_path: str, max_loras: int):
         max_model_len=256,           
         tensor_parallel_size=1,
         gpu_memory_utilization=0.65, 
-        enforce_eager=True,          # 启用CUDA graph来测试修复
+        enforce_eager=False,         
         disable_custom_all_reduce=True,
         trust_remote_code=True,
         max_num_seqs=16,             

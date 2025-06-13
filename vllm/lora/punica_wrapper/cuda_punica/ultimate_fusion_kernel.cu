@@ -525,7 +525,7 @@ __global__ void ultimate_fusion_kernel_v2(
  * @brief V1 内核实现模板函数
  */
 template <typename InputT, typename OutputT>
-void ultimate_fusion_kernel_impl_v1(
+void ultimate_fusion_kernel_impl_v2(
     const InputT* input_ptr, const InputT* qkv_weights_ptr,
     const void* lora_a_ptr_array, const void* lora_b_ptr_array,
     OutputT* output_ptr, const int* token_indices_sorted_ptr,
@@ -558,7 +558,7 @@ void ultimate_fusion_kernel_impl_v1(
 
   dim3 block(THREADS_PER_BLOCK);
   // 启动V1内核
-  ultimate_fusion_kernel_v1<InputT, OutputT, BM, BK, BN, THREADS_PER_BLOCK,
+  ultimate_fusion_kernel_v2<InputT, OutputT, BM, BK, BN, THREADS_PER_BLOCK,
                             WMMA_M, WMMA_N, WMMA_K><<<grid, block, 0, stream>>>(
       input_ptr, qkv_weights_ptr, lora_a_ptr_array, lora_b_ptr_array,
       output_ptr, token_indices_sorted_ptr, lora_ids_ptr,
