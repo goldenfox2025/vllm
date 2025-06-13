@@ -209,7 +209,7 @@ int cuda_ultimate_fusion_c(
             output_stride0, output_stride1, stream, input_dtype, output_dtype
         );
         
-        cudaStreamSynchronize(stream);
+        // cudaStreamSynchronize(stream);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA ultimate fusion kernel launch error: %s\n",

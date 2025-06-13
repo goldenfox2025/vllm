@@ -73,6 +73,7 @@ def cuda_ultimate_fusion_interface(
     lora_token_start_loc: torch.Tensor,
     lora_ids: torch.Tensor,
     lora_ranks: Optional[torch.Tensor] = None,
+    stream: Optional[int] = None,
 ) -> torch.Tensor:
     """
     终极融合内核的Python接口
@@ -263,7 +264,7 @@ def cuda_ultimate_fusion_interface(
         output_stride0,
         output_stride1,
         # Stream (null for default stream)
-        0,
+        stream,
         # Data types
         input_dtype,
         output_dtype

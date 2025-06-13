@@ -225,7 +225,8 @@ void ultimate_fusion_kernel_impl(
     // 检查错误
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        printf("Ultimate fusion kernel launch error: %s\n", cudaGetErrorString(err));
+        // std::cerr << "Ultimate fusion kernel launch error: " << cudaGetErrorString(err) << std::endl;
+        // printf("Ultimate fusion kernel launch error: %s\n", cudaGetErrorString(err));
     }
 }
 

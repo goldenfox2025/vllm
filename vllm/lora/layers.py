@@ -1259,7 +1259,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
             print(f"   lora_token_start_loc.device={lora_token_start_loc.device}")
             
             # 准备QKV权重（使用原始权重，不需要转置）
-            qkv_weights = self.base_layer.weight.contiguous()  # [qkv_output_size, hidden_size]
+            qkv_weights = self.base_layer.weight # [qkv_output_size, hidden_size]
             print(f"🔍 QKV权重: qkv_weights.shape={qkv_weights.shape}, device={qkv_weights.device}")
             print(f"🔍 输出切片: output_slices={self.output_slices}")
             
