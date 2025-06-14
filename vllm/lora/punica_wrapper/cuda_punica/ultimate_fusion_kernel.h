@@ -76,7 +76,8 @@ void launch_ultimate_fusion_kernel(
     int output_stride1,
     cudaStream_t stream,
     int input_dtype,
-    int output_dtype
+    int output_dtype,
+    void* intermediate_buffer_ptr
 );
 
 #endif // ULTIMATE_FUSION_KERNEL_H 

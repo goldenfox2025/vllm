@@ -167,6 +167,7 @@ int cuda_ultimate_fusion_c(
     const void* lora_a_ptr_array,
     const void* lora_b_ptr_array,
     void* output_ptr,
+    void* intermediate_buffer_ptr,
     const int* token_indices_sorted_ptr,
     const int* lora_ids_ptr,
     const int* num_tokens_per_lora_ptr,
@@ -206,7 +207,8 @@ int cuda_ultimate_fusion_c(
             qkv_output_size, num_slices, max_rank, input_stride0, input_stride1,
             qkv_stride0, qkv_stride1, lora_a_stride0, lora_a_stride1,
             lora_a_stride2, lora_b_stride0, lora_b_stride1, lora_b_stride2,
-            output_stride0, output_stride1, stream, input_dtype, output_dtype
+            output_stride0, output_stride1, stream, input_dtype, output_dtype,
+            intermediate_buffer_ptr
         );
         
         // cudaStreamSynchronize(stream);

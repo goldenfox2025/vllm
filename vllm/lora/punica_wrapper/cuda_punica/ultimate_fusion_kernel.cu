@@ -109,11 +109,6 @@ __global__ void ultimate_fusion_kernel(
     return;
   }
 
-  // 额外的安全检查：确保lora_id在合理范围内
-  if (lora_id < 0 || lora_id >= 8) {  // 假设最多8个LoRA
-    return;
-  }
-
   // === Step 4: 执行LoRA计算 ===
   // 获取指针数组 - 修复类型转换问题
   const uintptr_t* ptr_values_a =
@@ -128,9 +123,6 @@ __global__ void ultimate_fusion_kernel(
 
   // 遍历所有slice (Q, K, V)
   for (int slice_id = 0; slice_id < num_slices; slice_id++) {
-    // 边界检查
-    if (slice_id >= num_slices || slice_id < 0) continue;
-
     // 获取当前slice的LoRA A权重指针
     uintptr_t lora_a_addr = ptr_values_a[slice_id];
     const InputT* cur_lora_a_ptr = reinterpret_cast<const InputT*>(lora_a_addr);
@@ -260,7 +252,8 @@ void ultimate_fusion_kernel_impl(
     int input_stride1, int qkv_stride0, int qkv_stride1, int lora_a_stride0,
     int lora_a_stride1, int lora_a_stride2, int lora_b_stride0,
     int lora_b_stride1, int lora_b_stride2, int output_stride0,
-    int output_stride1, cudaStream_t stream, int max_active_loras) {
+    int output_stride1, cudaStream_t stream, int max_active_loras,
+    void* intermediate_buffer_ptr) {
   // Grid配置：每个token一个block
   dim3 grid(num_tokens);
 
@@ -308,8 +301,6 @@ __global__ void ultimate_fusion_kernel_v2(
     int lora_b_stride0, int lora_b_stride1, int lora_b_stride2,
     int output_stride0, int output_stride1) {
   int lora_id = blockIdx.x;
-  // NOTE: blockIdx.y is not used for slicing to allow for flexibility in the
-  // grid definition. Instead, slice_id is determined from cta_n_idx later.
 
   const int width_in_blocks = (qkv_output_size + max_rank * num_slices) / BN;
 
@@ -481,7 +472,6 @@ __global__ void ultimate_fusion_kernel_v2(
     // 而且cuda graph捕获多流的操作……应该是没搞懂，总之会有bug
     // 项目好一段时间没动了。也必须动一动。
 
-
     // 总而言之，先前的实现都可以放弃了
     // shrink是一个障碍。
     // 根据经验，sm打满远比HBM读写更重要
@@ -489,7 +479,6 @@ __global__ void ultimate_fusion_kernel_v2(
     // 之后在速度稳定的机器上进行一下对比
     // 也许fused expand路径会更快
     // 当然，本内核如果优化程度足够高，肯定能比空算版更好
-    
 
     // 此外，V1原始版本，稍微大点处理块，4070laptop就会爆寄存器/smem
     // 当然，可以做寄存器复用。共享内存也可以复用……但估计希望不大
@@ -575,7 +564,609 @@ void ultimate_fusion_kernel_impl_v2(
   }
 }
 
+// ==========================================================================================
+// V3 IMPLEMENTATION: Two-Kernel Approach
+// ==========================================================================================
+/**
+ * @brief V3 Kernel 1: 计算QKV，并对有LoRA的token计算Shrink部分 (input @ lora_a)
+ *
+ * - lora_id == -1: 计算 QKV 并写入 output_ptr
+ * - lora_id != -1: 计算 QKV 写入 output_ptr, 再计算 lora_a 并写入
+ * intermediate_buffer_ptr
+ */
+template <typename InputT, typename OutputT>
+__global__ void qkv_and_lora_shrink_kernel_v3(
+    const InputT* input_ptr, const InputT* qkv_weights_ptr,
+    const void* lora_a_ptr_array, OutputT* output_ptr,
+    float* intermediate_buffer_ptr,  // 中间结果缓冲区 [num_tokens, num_slices *
+                                     // max_rank]
+    const int* lora_ids_ptr, const int* num_tokens_per_lora_ptr,
+    const int* lora_token_start_loc_ptr, const int* lora_ranks_ptr,
+    int num_tokens, int hidden_size, int qkv_output_size, int num_slices,
+    int max_rank, int input_stride0, int input_stride1, int qkv_stride0,
+    int qkv_stride1, int lora_a_stride0, int lora_a_stride1, int lora_a_stride2,
+    int output_stride0, int output_stride1, int max_active_loras) {
+  const int token_idx = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int block_size = blockDim.x;
 
+  if (token_idx >= num_tokens) return;
+
+  extern __shared__ float shared_mem[];
+  float* s_hidden_state = shared_mem;  // size: [hidden_size]
+  float* s_lora_intermediate_slice =
+      shared_mem + hidden_size;  // size: [max_rank]
+
+  // Step 1: 加载输入向量到共享内存
+  for (int i = tid; i < hidden_size; i += block_size) {
+    s_hidden_state[i] = static_cast<float>(
+        input_ptr[token_idx * input_stride0 + i * input_stride1]);
+  }
+  __syncthreads();
+
+  // Step 2: 计算基础 QKV 路径 (所有token都执行)
+  for (int out_idx = tid; out_idx < qkv_output_size; out_idx += block_size) {
+    float accumulator = 0.0f;
+    for (int k = 0; k < hidden_size; ++k) {
+      accumulator +=
+          s_hidden_state[k] *
+          static_cast<float>(
+              qkv_weights_ptr[out_idx * qkv_stride0 + k * qkv_stride1]);
+    }
+    output_ptr[token_idx * output_stride0 + out_idx * output_stride1] =
+        static_cast<OutputT>(accumulator);
+  }
+
+  // Step 3: 查找当前 token 的 LoRA ID
+  int active_lora_idx = -1;
+  int lora_id = -1;
+  if (lora_token_start_loc_ptr && num_tokens_per_lora_ptr && lora_ids_ptr) {
+    int cumulative_tokens = 0;
+    for (int i = 0; i < max_active_loras; ++i) {
+      int tokens_for_this_lora = num_tokens_per_lora_ptr[i];
+      if (token_idx >= cumulative_tokens &&
+          token_idx < cumulative_tokens + tokens_for_this_lora) {
+        lora_id = lora_ids_ptr[i];
+        active_lora_idx = i;
+        break;
+      }
+      cumulative_tokens += tokens_for_this_lora;
+    }
+  }
+
+  // 如果没有活动的 LoRA，任务已完成
+  if (lora_id == -1) {
+    return;
+  }
+
+  // Step 4: LoRA Shrink 计算 (input @ lora_a)
+  const uintptr_t* ptr_values_a =
+      reinterpret_cast<const uintptr_t*>(lora_a_ptr_array);
+  if (!ptr_values_a) return;
+
+  int slice_rank =
+      (lora_ranks_ptr) ? lora_ranks_ptr[active_lora_idx] : max_rank;
+  if (slice_rank <= 0 || slice_rank > max_rank) return;
+
+  int intermediate_col_offset = 0;
+  for (int slice_id = 0; slice_id < num_slices; ++slice_id) {
+    __syncthreads();  // 确保上一轮的s_lora_intermediate_slice计算完成
+
+    const InputT* cur_lora_a_ptr =
+        reinterpret_cast<const InputT*>(ptr_values_a[slice_id]);
+    if (!cur_lora_a_ptr) {
+      intermediate_col_offset += max_rank;
+      continue;
+    }
+
+    // 计算 s_hidden_state @ cur_lora_a -> s_lora_intermediate_slice
+    for (int r = tid; r < slice_rank; r += block_size) {
+      float accumulator = 0.0f;
+      for (int k = 0; k < hidden_size; ++k) {
+        long long offset = (long long)lora_id * lora_a_stride0 +
+                           (long long)r * lora_a_stride1 +
+                           (long long)k * lora_a_stride2;
+        accumulator +=
+            s_hidden_state[k] * static_cast<float>(cur_lora_a_ptr[offset]);
+      }
+      s_lora_intermediate_slice[r] = accumulator;
+    }
+    __syncthreads();
+
+    // 将结果写入中间缓冲区
+    for (int r = tid; r < slice_rank; r += block_size) {
+      int buffer_idx =
+          token_idx * (num_slices * max_rank) + intermediate_col_offset + r;
+      intermediate_buffer_ptr[buffer_idx] = s_lora_intermediate_slice[r];
+    }
+    intermediate_col_offset += max_rank;  // 使用 max_rank 保证对齐
+  }
+}
+
+/**
+ * @brief V3 Kernel 2: 读取中间结果，计算Expand部分 (intermediate @
+ * lora_b)，并累加到最终输出
+ */
+template <typename InputT, typename OutputT>
+__global__ void lora_expand_and_add_kernel_v3(
+    const float* intermediate_buffer_ptr,  // 中间结果缓冲区
+    const void* lora_b_ptr_array, OutputT* output_ptr, const int* lora_ids_ptr,
+    const int* num_tokens_per_lora_ptr, const int* lora_token_start_loc_ptr,
+    const int* slice_starts_ptr, const int* lora_ranks_ptr, int num_tokens,
+    int qkv_output_size, int num_slices, int max_rank, int lora_b_stride0,
+    int lora_b_stride1, int lora_b_stride2, int output_stride0,
+    int output_stride1, int max_active_loras) {
+  const int token_idx = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int block_size = blockDim.x;
+
+  if (token_idx >= num_tokens) return;
+
+  // Step 1: 查找当前 token 的 LoRA ID
+  int active_lora_idx = -1;
+  int lora_id = -1;
+  if (lora_token_start_loc_ptr && num_tokens_per_lora_ptr && lora_ids_ptr) {
+    int cumulative_tokens = 0;
+    for (int i = 0; i < max_active_loras; ++i) {
+      int tokens_for_this_lora = num_tokens_per_lora_ptr[i];
+      if (token_idx >= cumulative_tokens &&
+          token_idx < cumulative_tokens + tokens_for_this_lora) {
+        lora_id = lora_ids_ptr[i];
+        active_lora_idx = i;
+        break;
+      }
+      cumulative_tokens += tokens_for_this_lora;
+    }
+  }
+
+  // 如果没有活动的 LoRA，则此 token 无需计算
+  if (lora_id == -1) {
+    return;
+  }
+
+  // Shared memory for the entire intermediate vector for this token
+  extern __shared__ float
+      s_lora_full_intermediate[];  // size: [num_slices * max_rank]
+
+  // Step 2: 加载中间向量到共享内存
+  const int intermediate_size = num_slices * max_rank;
+  for (int i = tid; i < intermediate_size; i += block_size) {
+    s_lora_full_intermediate[i] =
+        intermediate_buffer_ptr[token_idx * intermediate_size + i];
+  }
+  __syncthreads();
+
+  // Step 3: 计算 LoRA Expand 并累加
+  const uintptr_t* ptr_values_b =
+      reinterpret_cast<const uintptr_t*>(lora_b_ptr_array);
+  if (!ptr_values_b) return;
+
+  int slice_rank =
+      (lora_ranks_ptr) ? lora_ranks_ptr[active_lora_idx] : max_rank;
+  if (slice_rank <= 0 || slice_rank > max_rank) return;
+
+  int intermediate_col_offset = 0;
+  for (int slice_id = 0; slice_id < num_slices; ++slice_id) {
+    const InputT* cur_lora_b_ptr =
+        reinterpret_cast<const InputT*>(ptr_values_b[slice_id]);
+    if (!cur_lora_b_ptr) {
+      intermediate_col_offset += max_rank;
+      continue;
+    }
+
+    const float* s_intermediate_slice =
+        s_lora_full_intermediate + intermediate_col_offset;
+
+    int slice_start = slice_starts_ptr[slice_id];
+    int slice_end = (slice_id + 1 < num_slices) ? slice_starts_ptr[slice_id + 1]
+                                                : qkv_output_size;
+    int slice_size = slice_end - slice_start;
+
+    if (slice_start < 0 || slice_end > qkv_output_size || slice_size <= 0) {
+      intermediate_col_offset += max_rank;
+      continue;
+    }
+
+    // 计算 s_intermediate_slice @ lora_b, 并累加到输出
+    for (int out_idx_in_slice = tid; out_idx_in_slice < slice_size;
+         out_idx_in_slice += block_size) {
+      float accumulator = 0.0f;
+      for (int r = 0; r < slice_rank; ++r) {
+        long long offset = (long long)lora_id * lora_b_stride0 +
+                           (long long)out_idx_in_slice * lora_b_stride1 +
+                           (long long)r * lora_b_stride2;
+        accumulator += s_intermediate_slice[r] *
+                       static_cast<float>(cur_lora_b_ptr[offset]);
+      }
+
+      // Read-Modify-Write using a safe atomic CAS loop to prevent misaligned
+      // access errors.
+      int global_out_idx = slice_start + out_idx_in_slice;
+      long long output_offset = (long long)token_idx * output_stride0 +
+                                (long long)global_out_idx * output_stride1;
+
+      OutputT* target_addr = &output_ptr[output_offset];
+      unsigned short* target_addr_as_ushort =
+          reinterpret_cast<unsigned short*>(target_addr);
+
+      unsigned short old_val_ushort, assumed_val_ushort, new_val_ushort;
+      assumed_val_ushort = *target_addr_as_ushort;
+
+      do {
+        old_val_ushort = assumed_val_ushort;
+
+        OutputT old_val_T;
+        memcpy(&old_val_T, &old_val_ushort, sizeof(OutputT));
+
+        float new_val_float = static_cast<float>(old_val_T) + accumulator;
+
+        OutputT new_val_T = static_cast<OutputT>(new_val_float);
+        memcpy(&new_val_ushort, &new_val_T, sizeof(OutputT));
+
+        assumed_val_ushort =
+            atomicCAS(target_addr_as_ushort, old_val_ushort, new_val_ushort);
+      } while (assumed_val_ushort != old_val_ushort);
+    }
+    intermediate_col_offset += max_rank;  // 使用 max_rank 保证对齐
+  }
+}
+
+/**
+ * @brief V3 内核实现模板函数
+ */
+template <typename InputT, typename OutputT>
+void ultimate_fusion_kernel_impl_v3(
+    const InputT* input_ptr, const InputT* qkv_weights_ptr,
+    const void* lora_a_ptr_array, const void* lora_b_ptr_array,
+    OutputT* output_ptr, const int* token_indices_sorted_ptr,
+    const int* lora_ids_ptr, const int* num_tokens_per_lora_ptr,
+    const int* lora_token_start_loc_ptr, const int* slice_starts_ptr,
+    const int* lora_ranks_ptr, int num_tokens, int hidden_size,
+    int qkv_output_size, int num_slices, int max_rank, int input_stride0,
+    int input_stride1, int qkv_stride0, int qkv_stride1, int lora_a_stride0,
+    int lora_a_stride1, int lora_a_stride2, int lora_b_stride0,
+    int lora_b_stride1, int lora_b_stride2, int output_stride0,
+    int output_stride1, cudaStream_t stream, int max_active_loras,
+    void* intermediate_buffer_ptr) {
+  const int THREADS_PER_BLOCK = 256;
+
+  dim3 grid(num_tokens);
+
+  // 采用grid(max_active_loras, 1, z_grid_dim)的方式
+  // 并且使用共享内存
+  // 设想一下：当前cta负责lora2，那么，当前线程块可以根据actual_token_idx读取所有对应的token
+  // 而qkv权重是固定在那的
+  // 因此，可以直接将lora2的权重逻辑上视作放到后面
+  // 于是计算出最后结果（针对loraidx!=-1分支）
+  dim3 block(THREADS_PER_BLOCK);
+
+  size_t shared_mem_size_k1 = (hidden_size + max_rank) * sizeof(float);
+  qkv_and_lora_shrink_kernel_v3<InputT, OutputT>
+      <<<grid, block, shared_mem_size_k1, stream>>>(
+          input_ptr, qkv_weights_ptr, lora_a_ptr_array, output_ptr,
+          static_cast<float*>(intermediate_buffer_ptr), lora_ids_ptr,
+          num_tokens_per_lora_ptr, lora_token_start_loc_ptr, lora_ranks_ptr,
+          num_tokens, hidden_size, qkv_output_size, num_slices, max_rank,
+          input_stride0, input_stride1, qkv_stride0, qkv_stride1,
+          lora_a_stride0, lora_a_stride1, lora_a_stride2, output_stride0,
+          output_stride1, max_active_loras);
+
+  cudaError_t err1 = cudaGetLastError();
+  if (err1 != cudaSuccess) {
+    printf("V3 Kernel 1 (Shrink) launch error: %s\n", cudaGetErrorString(err1));
+    return;
+  }
+
+  size_t shared_mem_size_k2 = (num_slices * max_rank) * sizeof(float);
+  lora_expand_and_add_kernel_v3<InputT, OutputT>
+      <<<grid, block, shared_mem_size_k2, stream>>>(
+          static_cast<const float*>(intermediate_buffer_ptr), lora_b_ptr_array,
+          output_ptr, lora_ids_ptr, num_tokens_per_lora_ptr,
+          lora_token_start_loc_ptr, slice_starts_ptr, lora_ranks_ptr,
+          num_tokens, qkv_output_size, num_slices, max_rank, lora_b_stride0,
+          lora_b_stride1, lora_b_stride2, output_stride0, output_stride1,
+          max_active_loras);
+
+  cudaError_t err2 = cudaGetLastError();
+  if (err2 != cudaSuccess) {
+    printf("V3 Kernel 2 (Expand) launch error: %s\n", cudaGetErrorString(err2));
+  }
+}
+
+template <typename InputT, typename OutputT, int BM, int BK, int BN,
+          int THREADS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
+__global__ void v5_kernel1(
+    const InputT* input_ptr, const InputT* qkv_weights_ptr,
+    const void* lora_a_ptr_array, const void* lora_b_ptr_array,
+    OutputT* output_ptr, const int* token_indices_sorted_ptr,
+    const int* lora_ids_ptr, const int* num_tokens_per_lora_ptr,
+    const int* lora_token_start_loc_ptr, const int* slice_starts_ptr,
+    const int* lora_ranks_ptr, int num_tokens, int hidden_size,
+    int qkv_output_size, int num_slices, int max_rank, int input_stride0,
+    int input_stride1, int qkv_stride0, int qkv_stride1, int lora_a_stride0,
+    int lora_a_stride1, int lora_a_stride2, int lora_b_stride0,
+    int lora_b_stride1, int lora_b_stride2, int output_stride0,
+    int output_stride1, cudaStream_t stream, int max_active_loras,
+    void* intermediate_buffer_ptr) {
+  int lora_id = blockIdx.x;
+  const int width_in_blocks = (qkv_output_size + max_rank * num_slices) / BN;
+  int cta_m_idx = blockIdx.z / width_in_blocks;
+  int cta_n_idx = blockIdx.z % width_in_blocks;
+
+  int lora_idx = lora_ids_ptr[lora_id];
+  using namespace nvcuda;
+  // 定义WMMA fragments
+  using FragmentA = wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
+                                   InputT, wmma::row_major>;
+  using FragmentB = wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
+                                   InputT, wmma::row_major>;
+  using FragmentC =
+      wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+
+  // 这个逻辑决定了每个warp负责计算输出瓦片的哪个16x16部分
+  const int warps_in_m_dim = BM / WMMA_M;
+  const int warps_in_n_dim = BN / WMMA_N;
+  const int warp_id = threadIdx.x / warpSize;
+  const int warp_m = warp_id / warps_in_n_dim;
+  const int warp_n = warp_id % warps_in_n_dim;
+
+  if (lora_idx == -1) {
+    __shared__ InputT s_a[BM * BK];
+    __shared__ InputT s_b[BK * BN];
+    __shared__ float smem_output[BM * BN];
+
+    FragmentC frag_c;
+    wmma::fill_fragment(frag_c, 0.0f);
+
+    for (int k_tile_start = 0; k_tile_start < hidden_size; k_tile_start += BK) {
+      // 加载input
+      for (int i = threadIdx.x; i < BM * BK; i += blockDim.x) {
+        int m = i / BK;
+        int k = i % BK;
+
+        int token_row = cta_m_idx * BM + m;
+        int hidden_col = k_tile_start + k;
+        if (token_row < num_tokens && hidden_col < hidden_size) {
+          s_a[i] =
+              input_ptr[token_row * input_stride0 + hidden_col * input_stride1];
+        } else {
+          s_a[i] = InputT(0);
+        }
+      }
+
+      // 加载qkv权重
+      for (int i = threadIdx.x; i < BK * BN; i += blockDim.x) {
+        int k = i / BN;
+        int n = i % BN;
+        int weight_row = k_tile_start + k;
+        int weight_col =
+            cta_n_idx * BN + n;  // Corrected: qkv is (hidden, qkv_out) layout
+        if (weight_col < qkv_output_size && weight_row < hidden_size) {
+          s_b[k * BN + n] = qkv_weights_ptr[weight_row * qkv_stride0 +
+                                            weight_col * qkv_stride1];
+        } else {
+          s_b[k * BN + n] = InputT(0);
+        }
+      }
+      __syncthreads();  // 确保s_a和s_b加载完成
+
+      // 在已加载的共享内存瓦片上进行计算
+      for (int k_step = 0; k_step < BK; k_step += WMMA_K) {
+        FragmentA frag_a;
+        FragmentB frag_b;
+        int s_a_row_offset = warp_m * WMMA_M;
+        int s_a_col_offset = k_step;
+        int s_b_row_offset = k_step;
+        int s_b_col_offset = warp_n * WMMA_N;
+
+        wmma::load_matrix_sync(frag_a,
+                               s_a + s_a_row_offset * BK + s_a_col_offset, BK);
+        wmma::load_matrix_sync(frag_b,
+                               s_b + s_b_row_offset * BN + s_b_col_offset, BN);
+
+        // 每个warp在自己的寄存器中累加结果
+        wmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
+      }
+      __syncthreads();  // 确保所有warp都完成了对当前瓦片的计算
+    }
+
+    // 每个warp负责的16x16瓦片存储到共享内存的目标地址
+    int smem_warp_row_offset = warp_m * WMMA_M;
+    int smem_warp_col_offset = warp_n * WMMA_N;
+    wmma::store_matrix_sync(
+        smem_output + smem_warp_row_offset * BN + smem_warp_col_offset, frag_c,
+        BN, wmma::mem_row_major);
+    __syncthreads();
+
+    // 输出
+    for (int i = threadIdx.x; i < BM * BN; i += blockDim.x) {
+      int m_local = i / BN;
+      int n_local = i % BN;
+
+      int output_row = cta_m_idx * BM + m_local;
+      int output_col = cta_n_idx * BN + n_local;
+
+      if (output_row < num_tokens && output_col < qkv_output_size) {
+        output_ptr[output_row * output_stride0 + output_col * output_stride1] =
+            static_cast<OutputT>(smem_output[i]);
+      }
+    }
+    return;  // 基础任务完成，直接返回
+  } else {
+    __shared__ InputT s_a[BM * BK];
+    __shared__ InputT s_b[BK * BN];
+    __shared__ float smem_output[BM * BN];
+    const int lora_m_idx_start = lora_token_start_loc[lora_idx];
+    const int lora_m_size = num_tokens_per_lora[lora_idx];
+
+    const uintptr_t* ptr_values_a =
+        reinterpret_cast<const uintptr_t*>(lora_a_ptr_array);
+    const uintptr_t* ptr_values_b =
+        reinterpret_cast<const uintptr_t*>(lora_b_ptr_array);
+
+    // 空指针检查
+    if (ptr_values_a == nullptr || ptr_values_b == nullptr) {
+      return;
+    }
+    FragmentC frag_c;
+    wmma::fill_fragment(frag_c, 0.0f);
+    bool is_lora = BN * cta_n_idx >= qkv_output_size;
+    for (int k_tile_start = 0; k_tile_start < hidden_size; k_tile_start += BK) {
+      // load input
+      for (int load_idx = threadIdx.x; load_idx < BM * BK;
+           load_idx += blockDim.x) {
+        int m = load_idx / BK;
+        int k = load_idx % BK;
+        int gm = cta_m_idx * BM + m;
+        int gk = k_tile_start + k;
+        InputT val = InputT(0);
+        const int actual_token_idx =
+            token_indices_sorted[lora_m_idx_start + gm];
+        if (actual_token_idx < lora_m_size && gk < hidden_size) {
+          val =
+              input_ptr[actual_token_idx * input_stride0 + gk * input_stride1];
+        }
+        s_a[load_idx] = val;
+      }
+      // load B matrix
+      for (int load_idx = threadIdx.x; load_idx < BK * BN;
+           load_idx += blockDim.x) {
+        int k = load_idx / BN;
+        int n = load_idx % BN;
+        // 这里需要注意
+        if (is_lora) {
+          int slice_id = (BN * cta_n_idx - qkv_output_size) / max_rank;
+
+          uintptr_t lora_a_addr = ptr_values_a[slice_id];
+          const InputT* cur_lora_a_ptr =
+              reinterpret_cast<const InputT*>(lora_a_addr);
+          // max_rank可能小于BN
+          int gm = cta_m_idx * BM + k;
+          int gk = k_tile_start + k;
+          InputT val = InputT(0);
+          if (gm < max_rank && gk < hidden_size) {
+            val = cur_lora_a_ptr[gm * lora_a_stride0 + gk * lora_a_stride1];
+          }
+          s_b[load_idx] = val;
+        } else {
+          int weight_row = k_tile_start + k;
+          int weight_col = cta_n_idx * BN + n;
+          if (weight_col < qkv_output_size && weight_row < hidden_size) {
+            s_b[k * BN + n] = qkv_weights_ptr[weight_row * qkv_stride0 +
+                                              weight_col * qkv_stride1];
+          } else {
+            s_b[k * BN + n] = InputT(0);
+          }
+        }
+      }
+
+      __syncthreads();
+
+      // 在已加载的共享内存瓦片上进行计算
+      for (int k_step = 0; k_step < BK; k_step += WMMA_K) {
+        FragmentA frag_a;
+        FragmentB frag_b;
+        int s_a_row_offset = warp_m * WMMA_M;
+        int s_a_col_offset = k_step;
+        int s_b_row_offset = k_step;
+        int s_b_col_offset = warp_n * WMMA_N;
+
+        wmma::load_matrix_sync(frag_a,
+                               s_a + s_a_row_offset * BK + s_a_col_offset, BK);
+        wmma::load_matrix_sync(frag_b,
+                               s_b + s_b_row_offset * BN + s_b_col_offset, BN);
+
+        // 每个warp在自己的寄存器中累加结果
+        wmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
+      }
+      __syncthreads();  // 确保所有warp都完成了对当前瓦片的计算
+    }
+    // 输出
+
+    int smem_warp_row_offset = warp_m * WMMA_M;
+    int smem_warp_col_offset = warp_n * WMMA_N;
+    wmma::store_matrix_sync(
+        smem_output + smem_warp_row_offset * BN + smem_warp_col_offset, frag_c,
+        BN, wmma::mem_row_major);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < BM * BN; i += blockDim.x) {
+      int m_local = i / BN;
+      int n_local = i % BN;
+
+      if (is_lora) {
+        // intermediate_buffer_ptr
+        // [num_tokens, max_rank*num_slices]
+        const int gm = cta_m_idx * BM + m_local;
+        const int actual_token_idx =
+            token_indices_sorted[lora_m_idx_start + gm];
+        const int slice_id = (BN * cta_n_idx - qkv_output_size) / max_rank;
+        const int rank_offset = slice_id * max_rank;
+        const int intermediate_offset =
+            actual_token_idx * (max_rank * num_slices) + (rank_offset + n_local);
+        intermediate_buffer_ptr[intermediate_offset] =
+            static_cast<OutputT>(smem_output[i]);
+      } else {
+        const int gm = cta_m_idx * BM + m_local;
+        const int gn = cta_n_idx * BN + n_local;
+        const int actual_token_idx =
+            token_indices_sorted[lora_m_idx_start + gm];
+        output_ptr[actual_token_idx * output_stride0 + gn * output_stride1] =
+            static_cast<OutputT>(smem_output[i]);
+      }
+    }
+    return;
+  }
+}
+
+
+
+
+template <typename InputT, typename OutputT>
+void ultimate_fusion_kernel_impl_v5(
+    const InputT* input_ptr, const InputT* qkv_weights_ptr,
+    const void* lora_a_ptr_array, const void* lora_b_ptr_array,
+    OutputT* output_ptr, const int* token_indices_sorted_ptr,
+    const int* lora_ids_ptr, const int* num_tokens_per_lora_ptr,
+    const int* lora_token_start_loc_ptr, const int* slice_starts_ptr,
+    const int* lora_ranks_ptr, int num_tokens, int hidden_size,
+    int qkv_output_size, int num_slices, int max_rank, int input_stride0,
+    int input_stride1, int qkv_stride0, int qkv_stride1, int lora_a_stride0,
+    int lora_a_stride1, int lora_a_stride2, int lora_b_stride0,
+    int lora_b_stride1, int lora_b_stride2, int output_stride0,
+    int output_stride1, cudaStream_t stream, int max_active_loras,
+    void* intermediate_buffer_ptr) {
+  constexpr int BM = 32;
+  constexpr int BK = 32;
+  constexpr int BN = 32;
+
+  const int N_LEN = qkv_output_size + num_slices * max_rank;
+  const int z_grid_dim = ((num_tokens + BM - 1) / BM) * ((N_LEN + BN - 1) / BN);
+
+  constexpr int WARP_SIZE = 32;
+  constexpr int WMMA_M = 16;
+  constexpr int WMMA_N = 16;
+  constexpr int WMMA_K = 16;
+  constexpr int THREADS_PER_BLOCK = WARP_SIZE * BM * BN / (WMMA_M * WMMA_N);
+  dim3 grid_kernel1(max_active_loras, 1, z_grid_dim);
+  dim3 block_kernel1(THREADS_PER_BLOCK);
+  // 共享内存大小
+
+  v5_kernel1<InputT, OutputT, BM, BK, BN, THREADS_PER_BLOCK, WMMA_M, WMMA_N,
+             WMMA_K><<<grid_kernel1, block_kernel1, 0, stream>>>(
+      input_ptr, qkv_weights_ptr, lora_a_ptr_array, lora_b_ptr_array,
+      output_ptr, token_indices_sorted_ptr, lora_ids_ptr,
+      num_tokens_per_lora_ptr, lora_token_start_loc_ptr, slice_starts_ptr,
+      lora_ranks_ptr, num_tokens, hidden_size, qkv_output_size, num_slices,
+      max_rank, input_stride0, input_stride1, qkv_stride0, qkv_stride1,
+      lora_a_stride0, lora_a_stride1, lora_a_stride2, lora_b_stride0,
+      lora_b_stride1, lora_b_stride2, output_stride0, output_stride1, stream,
+      max_active_loras, intermediate_buffer_ptr);
+
+
+  // 启动kernel2 用于对intermediate_buffer_ptr进行expand，并读取output_ptr相加再写入output_ptr
+
+}
 
 void launch_ultimate_fusion_kernel(
     const void* input_ptr, const void* qkv_weights_ptr,
@@ -589,10 +1180,10 @@ void launch_ultimate_fusion_kernel(
     int lora_a_stride0, int lora_a_stride1, int lora_a_stride2,
     int lora_b_stride0, int lora_b_stride1, int lora_b_stride2,
     int output_stride0, int output_stride1, cudaStream_t stream,
-    int input_dtype, int output_dtype) {
+    int input_dtype, int output_dtype, void* intermediate_buffer_ptr) {
   // 根据数据类型分发
   if (input_dtype == 0 && output_dtype == 0) {  // fp16 -> fp16
-    ultimate_fusion_kernel_impl<__half, __half>(
+    ultimate_fusion_kernel_impl_v5<__half, __half>(
         static_cast<const __half*>(input_ptr),
         static_cast<const __half*>(qkv_weights_ptr), lora_a_ptr_array,
         lora_b_ptr_array, static_cast<__half*>(output_ptr),
@@ -601,9 +1192,10 @@ void launch_ultimate_fusion_kernel(
         hidden_size, qkv_output_size, num_slices, max_rank, input_stride0,
         input_stride1, qkv_stride0, qkv_stride1, lora_a_stride0, lora_a_stride1,
         lora_a_stride2, lora_b_stride0, lora_b_stride1, lora_b_stride2,
-        output_stride0, output_stride1, stream, max_active_loras);
+        output_stride0, output_stride1, stream, max_active_loras,
+        intermediate_buffer_ptr);
   } else if (input_dtype == 1 && output_dtype == 1) {  // bf16 -> bf16
-    ultimate_fusion_kernel_impl<__nv_bfloat16, __nv_bfloat16>(
+    ultimate_fusion_kernel_impl_v5<__nv_bfloat16, __nv_bfloat16>(
         static_cast<const __nv_bfloat16*>(input_ptr),
         static_cast<const __nv_bfloat16*>(qkv_weights_ptr), lora_a_ptr_array,
         lora_b_ptr_array, static_cast<__nv_bfloat16*>(output_ptr),
@@ -612,7 +1204,8 @@ void launch_ultimate_fusion_kernel(
         hidden_size, qkv_output_size, num_slices, max_rank, input_stride0,
         input_stride1, qkv_stride0, qkv_stride1, lora_a_stride0, lora_a_stride1,
         lora_a_stride2, lora_b_stride0, lora_b_stride1, lora_b_stride2,
-        output_stride0, output_stride1, stream, max_active_loras);
+        output_stride0, output_stride1, stream, max_active_loras,
+        intermediate_buffer_ptr);
   } else {
     std::cerr << "Ultimate fusion kernel: Unsupported dtype combination: input="
               << input_dtype << ", output=" << output_dtype << std::endl;

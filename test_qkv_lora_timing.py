@@ -30,7 +30,7 @@ import glob
 from pathlib import Path
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
-# os.environ["VLLM_ENABLE_ULTIMATE_FUSION"] = "1"
+os.environ["VLLM_ENABLE_ULTIMATE_FUSION"] = "1"
 def setup_performance_environment():
     """设置性能测试环境变量"""
     print("🔧 设置性能测试环境...")
