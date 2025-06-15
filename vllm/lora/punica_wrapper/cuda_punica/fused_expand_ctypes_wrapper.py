@@ -56,7 +56,6 @@ def cuda_fused_qkv_expand_interface(
     no_lora_flag: bool,
 ) -> bool:
     """
-    调用简化版fused expand kernel
     
     Args:
         fused_matmul_output: 融合矩阵乘法的完整输出

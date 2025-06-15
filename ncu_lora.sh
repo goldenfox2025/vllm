@@ -22,14 +22,14 @@ echo ""
 # Focus on triton kernels and skip some initial launches to avoid warmup
 # --kernel-name "regex:.*(lora|triton).*" \
 ncu \
-    --kernel-name "regex:.*(lora|triton).*" \
+    --kernel-name "v5_kernel2" \
     --target-processes all \
-    --launch-skip 500 \
+    --launch-skip 100 \
     --launch-count 10 \
     --replay-mode kernel \
     --set full \
     --export "ncu_reports/${REPORT_NAME}" \
-    python3 run_vllm_lora_ncu.py
+    python3 test_qkv_lora_timing.py
 
 echo ""
 echo "=== Capture Complete ==="

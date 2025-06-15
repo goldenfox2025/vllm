@@ -44,78 +44,10 @@ try:
             ctypes.c_int,     # output_dtype
         ]
         cuda_c_lib.cuda_lora_shrink_c.restype = ctypes.c_int
-
-        # Define function signatures for expand - 更新为Triton兼容接口
-        cuda_c_lib.cuda_lora_expand_c.argtypes = [
-            ctypes.c_void_p,  # input_ptr
-            ctypes.c_void_p,  # lora_b_ptr
-            ctypes.c_void_p,  # output_ptr
-            ctypes.c_void_p,  # token_indices_sorted_ptr
-            ctypes.c_void_p,  # lora_ids_ptr
-            ctypes.c_void_p,  # num_tokens_per_lora_ptr
-            ctypes.c_void_p,  # lora_token_start_loc_ptr
-            ctypes.c_void_p,  # slice_starts_ptr
-            ctypes.c_void_p,  # lora_strides_d0_ptr
-            ctypes.c_void_p,  # lora_strides_d1_ptr
-            ctypes.c_void_p,  # lora_strides_d2_ptr
-            ctypes.c_void_p,  # hidden_sizes_ptr
-            ctypes.c_int,     # max_active_loras
-            ctypes.c_int,     # num_total_tokens_in_batch
-            ctypes.c_int,     # lora_rank
-            ctypes.c_int,     # hidden_size
-            ctypes.c_int,     # num_slices
-            ctypes.c_int,     # offset_start
-            ctypes.c_int,     # add_inputs
-            ctypes.c_int,     # input_stride0
-            ctypes.c_int,     # input_stride1
-            ctypes.c_int,     # input_stride2
-            ctypes.c_int,     # output_stride0
-            ctypes.c_int,     # output_stride1
-            ctypes.c_void_p,  # stream
-            ctypes.c_int,     # input_dtype
-            ctypes.c_int,     # output_dtype
-        ]
-        cuda_c_lib.cuda_lora_expand_c.restype = ctypes.c_int
-
         cuda_c_lib.test_cuda_kernel.argtypes = []
         cuda_c_lib.test_cuda_kernel.restype = ctypes.c_int
         
-        # Define function signatures for ultimate fusion kernel
-        cuda_c_lib.cuda_ultimate_fusion_c.argtypes = [
-            ctypes.c_void_p,  # input_ptr
-            ctypes.c_void_p,  # qkv_weights_ptr
-            ctypes.c_void_p,  # lora_a_ptr_array
-            ctypes.c_void_p,  # lora_b_ptr_array
-            ctypes.c_void_p,  # output_ptr
-            ctypes.c_void_p,  # token_indices_sorted_ptr
-            ctypes.c_void_p,  # lora_ids_ptr
-            ctypes.c_void_p,  # num_tokens_per_lora_ptr
-            ctypes.c_void_p,  # lora_token_start_loc_ptr
-            ctypes.c_void_p,  # slice_starts_ptr
-            ctypes.c_void_p,  # lora_ranks_ptr
-            ctypes.c_int,     # max_active_loras
-            ctypes.c_int,     # num_tokens
-            ctypes.c_int,     # hidden_size
-            ctypes.c_int,     # qkv_output_size
-            ctypes.c_int,     # num_slices
-            ctypes.c_int,     # max_rank
-            ctypes.c_int,     # input_stride0
-            ctypes.c_int,     # input_stride1
-            ctypes.c_int,     # qkv_stride0
-            ctypes.c_int,     # qkv_stride1
-            ctypes.c_int,     # lora_a_stride0
-            ctypes.c_int,     # lora_a_stride1
-            ctypes.c_int,     # lora_a_stride2
-            ctypes.c_int,     # lora_b_stride0
-            ctypes.c_int,     # lora_b_stride1
-            ctypes.c_int,     # lora_b_stride2
-            ctypes.c_int,     # output_stride0
-            ctypes.c_int,     # output_stride1
-            ctypes.c_void_p,  # stream_ptr
-            ctypes.c_int,     # input_dtype
-            ctypes.c_int,     # output_dtype
-        ]
-        cuda_c_lib.cuda_ultimate_fusion_c.restype = ctypes.c_int
+
         
         C_LIB_AVAILABLE = True
         print(f"Pure C CUDA library loaded: {lib_path}")

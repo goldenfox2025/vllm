@@ -77,7 +77,7 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
 
 # Enable CUDA separable compilation
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
-
+include_directories(/home/vllm/vllm/lora/punica_wrapper/cuda_punica/cutlass/include)
 # Source files
 set(CUDA_SOURCES
     lora_shrink_kernel.cu
